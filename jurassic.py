@@ -69,6 +69,9 @@ def run_lacosmic(frame_data, mask):
     """
     from astropy import log
     log.setLevel('ERROR') 
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
     
     masked_arr = np.where(mask, frame_data, np.nan)
     _, _, std = sigma_clipped_stats(masked_arr)
@@ -153,6 +156,9 @@ def make_reference_cube(pixel,grad_cube):
     """
     makes a reference cube and gets a median from it
     """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+
     row,col = pixel
     pix = grad_cube[:,row,col]
 
@@ -605,14 +611,6 @@ class Jurassic():
         print(f"SEP: {len(non_empty_filt)} / {self.n_frame} frames with filtered detections "
               f"({len(self.filtered_sep_df)} total sources)")
 
-        # # run in parallel
-        # results = Parallel(n_jobs=num_cores, prefer="processes")(tasks)
-        # obj_dfs, filtered_dfs = zip(*results)
-
-        # # combine all frames, ignore empty dfs
-        # self.total_df = pd.concat([df for df in obj_dfs if len(df) > 0], ignore_index=True)
-        # self.filtered_sep_df = pd.concat([df for df in filtered_dfs if len(df) > 0], ignore_index=True)
-
         # save csv's of the filtered and unfiltered dfs
         if save:
             filepath = os.path.join(self.obs_dir, "filtered_sources.csv")
@@ -620,50 +618,6 @@ class Jurassic():
 
             filepath = os.path.join(self.obs_dir, "all_sources.csv")
             self.total_df.to_csv(filepath, index=False)
-
-
-    # def _masked_reference(self,mask_radius=10):
-    #     """
-    #     Makes a reference frame (median) but masks out any variable sources
-    #     no infilling
-    #     """
-    #     reference_cube = np.zeros_like(self.grad_cube) # array of zeros to build mask off
-    #     for frame in self.frames:
-    #         if frame in self.filtered_sep_df['frame'].values:
-    #             mask = np.zeros_like(self.grad_cube[0])
-
-    #             frame_df = self.filtered_sep_df[self.filtered_sep_df['frame']==frame]
-    #             x_float = frame_df['x'].values
-    #             x_int = [round(x) for x in x_float]
-    #             y_float = frame_df['y'].values
-    #             y_int = [round(y) for y in y_float]
-
-    #             for i in range(len(x_int)):
-    #                 mask[y_int[i],x_int[i]] = 1 # centre of each detected source is now one
-
-    #             kernel = self._circle_app(mask_radius)
-    #             mask_conv = convolve_fft(mask, kernel)
-    #             reference_cube[frame] = mask_conv
-        
-    #     # filepath = os.path.join(self.obs_dir, "reference_cube.npy")
-    #     # np.save(filepath, reference_cube)
-
-    #     self.reference_cube = reference_cube >= 0.00001
-    #     # filepath = os.path.join(self.obs_dir, "reference_cube_bool.npy")
-    #     # np.save(filepath, self.reference_cube)
-
-    #     no_nans = np.nansum(self.grad_cube,axis=(1,2)) > 0
-    #     no_nans[self.bad_frames] = False
-
-    #     good_slices = self.grad_cube.copy()[no_nans]
-    #     mask_slices = self.reference_cube.copy()[no_nans]
-
-    #     masked_slices = np.where(mask_slices, np.nan, good_slices)
-
-    #     self.second_ref_frame = np.nanmedian(masked_slices,axis=0)
-
-    #     filepath = os.path.join(self.obs_dir, "second_reference_frame.npy")
-    #     np.save(filepath, self.second_ref_frame)
 
         
     def _masked_reference(self,mask_radius=10):
@@ -709,17 +663,17 @@ class Jurassic():
             result = inpaint.inpaint_biharmonic(image,mask)
             infilled[i] = result
 
-        self.infilled = infilled
+        # making sure to only use the 'good' frames (not fake or all nan frames)
+        no_nans = np.nansum(self.grad_cube,axis=(1,2)) > 0
+        no_nans[self.bad_frames] = False
+        self.infilled = infilled.copy()[no_nans]
+
+        # saving the infilled cube
         filepath = os.path.join(self.obs_dir, "infilled_ref_cube.npy")
         np.save(filepath, self.infilled)
 
-        # masking out the all nan frames and the fake frames
-        not_all_nans = np.nansum(self.grad_cube,axis=(1,2)) > 0
-        not_all_nans[self.bad_frames] = False
-
-        good_slices = self.infilled.copy()[not_all_nans]
-
-        self.second_ref_frame = np.nanmedian(good_slices,axis=0)
+        # nanmedian the infilled cube and then save the resulting reference
+        self.second_ref_frame = np.nanmedian(self.infilled,axis=0)
 
         filepath = os.path.join(self.obs_dir, "second_reference_frame.npy")
         np.save(filepath, self.second_ref_frame)
@@ -729,6 +683,7 @@ class Jurassic():
         """
         uses lacosmic to remove the cosmic rays in each frame
         """
+        # run lacosmic on each frame in parallel
         results = Parallel(n_jobs=num_cores,verbose=0)(delayed(run_lacosmic)(cube[i],self.mask_tot) for i in range(len(cube)))
         clean_cube = np.array([r[0] for r in results])
         cr_mask_cube = np.array([r[1] for r in results])
@@ -757,6 +712,7 @@ class Jurassic():
         """
         making a significance cube - dividing the differenced cube by the 
         standard deviation of the background of each frame
+        Then making a cut based on a ~magic number~ which at this point is just 3
         """
         frame_num = list(range(0, self.n_frame))
         sig_cube = np.zeros_like(self.diff_cube)
@@ -797,6 +753,7 @@ class Jurassic():
     def _cube_rolling_sum(self,num_frames=4,threshold=3):
         """
         rolling sum over (num_frames) frames of threshold cube, cut for >= threshold
+        to identify 'significant' flux changes
         """
         good_frames_cube = np.delete(self.bool_threshold_cube, self.bad_frames, axis=0)
         n_good = good_frames_cube.shape[0]
@@ -822,7 +779,7 @@ class Jurassic():
                 rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
                 bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
             else:
-                #insert after itself - I drew a little diagram to work this out
+                #insert after itself - I drew a little diagram to work this out (i now have no clue where this diag is)
                 rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
                 bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
             i += 1
@@ -1022,13 +979,10 @@ class Jurassic():
         print(f'{safe_max(g_sig_df["objid"])} objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg001_mirimage_ramp.fits'
-        # '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279002001_03101_00001_mirimage_ramp.fits',
-        #  '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279002001_03101_00002_mirimage_ramp.fits',
-        #  '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00001_mirimage_ramp.fits',
-        #  '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00002_mirimage_ramp.fits',
-        #  '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00003_mirimage_ramp.fits',
-        #  '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00004_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg004_mirimage_ramp.fits'
          ]
 
 for file in files:
