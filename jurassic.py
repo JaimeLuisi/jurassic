@@ -613,8 +613,9 @@ class Jurassic():
 
         # save csv's of the filtered and unfiltered dfs
         if save:
-            filepath = os.path.join(self.obs_dir, "filtered_sources.csv")
-            self.filtered_sep_df.to_csv(filepath, index=False)
+            if len(self.filtered_sep_df) > 0:
+                filepath = os.path.join(self.obs_dir, "filtered_sources.csv")
+                self.filtered_sep_df.to_csv(filepath, index=False)
 
             filepath = os.path.join(self.obs_dir, "all_sources.csv")
             self.total_df.to_csv(filepath, index=False)
@@ -802,8 +803,9 @@ class Jurassic():
         significance_df = pd.DataFrame(data_dict)
         self.significance_df = significance_df
         
-        filepath = os.path.join(self.obs_dir, 'significance.csv')
-        significance_df.to_csv(filepath,index=False)
+        if len(self.significance_df) > 0:
+            filepath = os.path.join(self.obs_dir, 'significance.csv')
+            significance_df.to_csv(filepath,index=False)
 
 
 # ------------------------------ Output stuff! ----------------------------
@@ -816,10 +818,10 @@ class Jurassic():
 
         from sklearn.cluster import DBSCAN
 
-        if df.empty:
-            output = df.copy()
-            output['objid'] = pd.Series(dtype=int)
-            return output
+        # if df.empty:
+        #     output = df.copy()
+        #     output['objid'] = pd.Series(dtype=int)
+        #     return output
 
         output = df.copy()
 
@@ -838,9 +840,9 @@ class Jurassic():
         Determines if in the grouped detections there are any potential asteroids
         A potential asteroid has travelled a distance greater than 'threshold'.
         """
-        # deal withg a no detections case
-        if df.empty:
-            return 0, None
+        # # deal withg a no detections case
+        # if df.empty:
+        #     return 0, None
 
         num_candidates = 0
         ids = []
@@ -908,6 +910,9 @@ class Jurassic():
         from collections import Counter
 
         def safe_max(series):
+            """
+            Returns max if there is one, returns 0 otherwise
+            """
             if series is None:
                 return 0
             if not hasattr(series, "__len__"):
@@ -922,34 +927,36 @@ class Jurassic():
         # make a folder for the grouped output
         self.grouped_dir = os.path.join(self.obs_dir, 'grouped_output')
         os.makedirs(self.grouped_dir, exist_ok=True)
-
-        g_sig_df = self._spatial_group(self.significance_df)
-        g_sig_df = g_sig_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
-        g_sig_df = self.assign_mjd(g_sig_df)
-        filepath = os.path.join(self.grouped_dir, 'grouped_significance.csv')
-        g_sig_df.to_csv(filepath,index=False)
+        
+        if len(self.significance_df) > 0:
+            g_sig_df = self._spatial_group(self.significance_df)
+            g_sig_df = g_sig_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
+            g_sig_df = self.assign_mjd(g_sig_df)
+            filepath = os.path.join(self.grouped_dir, 'grouped_significance.csv')
+            g_sig_df.to_csv(filepath,index=False)
 
         # filtered sep sources (grouped)
-        g_filt_sep_df = self._spatial_group(self.filtered_sep_df)
-        g_filt_sep_df = g_filt_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
-        g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
-        g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
+        if len(self.filtered_sep_df) > 0:
+            g_filt_sep_df = self._spatial_group(self.filtered_sep_df)
+            g_filt_sep_df = g_filt_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
+            g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
+            g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
 
-        num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
-        counts = Counter(g_filt_sep_df['objid'].to_numpy()) if not g_filt_sep_df.empty else Counter()
-        g_thresh_sep_df = g_filt_sep_df.copy()
-        if 'objid' not in g_thresh_sep_df.columns:
-            g_thresh_sep_df = self._spatial_group(g_thresh_sep_df)
+            num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
+            counts = Counter(g_filt_sep_df['objid'].to_numpy()) if not g_filt_sep_df.empty else Counter()
+            g_thresh_sep_df = g_filt_sep_df.copy()
+            if 'objid' not in g_thresh_sep_df.columns:
+                g_thresh_sep_df = self._spatial_group(g_thresh_sep_df)
 
-        if not g_thresh_sep_df.empty:
-            g_thresh_sep_df["obj_count"] = g_thresh_sep_df["objid"].map(counts).fillna(0).astype(int)
-            g_thresh_sep_df = g_thresh_sep_df[g_thresh_sep_df['obj_count'] >= 3]
-        else:
-            g_thresh_sep_df["obj_count"] = pd.Series(dtype=int)
+            if not g_thresh_sep_df.empty:
+                g_thresh_sep_df["obj_count"] = g_thresh_sep_df["objid"].map(counts).fillna(0).astype(int)
+                g_thresh_sep_df = g_thresh_sep_df[g_thresh_sep_df['obj_count'] >= 3]
+            else:
+                g_thresh_sep_df["obj_count"] = pd.Series(dtype=int)
 
-        g_thresh_sep_df = self.assign_mjd(g_thresh_sep_df)
-        filepath = os.path.join(self.grouped_dir, 'grouped_thresholded_sep.csv')
-        g_thresh_sep_df.to_csv(filepath,index=False)
+            g_thresh_sep_df = self.assign_mjd(g_thresh_sep_df)
+            filepath = os.path.join(self.grouped_dir, 'grouped_thresholded_sep.csv')
+            g_thresh_sep_df.to_csv(filepath,index=False)
         
         g_tot_sep_df = self._spatial_group(self.total_df)
         g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
@@ -961,28 +968,38 @@ class Jurassic():
 
         with open(full_file_path, "w") as f:
             print(f"{safe_max(g_tot_sep_df['objid'])} total objects identified by sep", file=f)
-            print(f"{safe_max(g_filt_sep_df['objid'])} filtered objects identified by sep", file=f)
-            print(f"----- {num_candidates} asteroid candidates in filtered objects", file=f)
-            if len(data) >= 1:
-                for i in range(len(data)):
-                    print(f"---------- {data[i]}", file=f)
-            print(f"{safe_max(g_thresh_sep_df['objid'])} filtered & thresholded objects identified by sep", file=f)
-            print(f"{safe_max(g_sig_df['objid'])} objects identified by significance", file=f)
+            if len(self.filtered_sep_df) > 0:
+                print(f"{safe_max(g_filt_sep_df['objid'])} filtered objects identified by sep", file=f)
+                print(f"----- {num_candidates} asteroid candidates in filtered objects", file=f)
+                if len(data) >= 1:
+                    for i in range(len(data)):
+                        print(f"---------- {data[i]}", file=f)
+                print(f"{safe_max(g_thresh_sep_df['objid'])} filtered & thresholded objects identified by sep", file=f)
+            else:
+                print('0 objects passed through filtering', file=f)
+            if len(self.significance_df) > 0:
+                print(f"{safe_max(g_sig_df['objid'])} objects identified by significance", file=f)
+            else:
+                print('0 objects identified by significance', file=f)
 
         print(f'{safe_max(g_tot_sep_df["objid"])} total objects identified by sep')
-        print(f'{safe_max(g_filt_sep_df["objid"])} filtered objects identified by sep')
-        print(f"----- {num_candidates} asteroid candidates in filtered objects")
-        if len(data) >= 1:
-            for i in range(len(data)):
-                print(f"---------- {data[i]}")
-        print(f'{safe_max(g_thresh_sep_df["objid"])} filtered & thresholded objects identified by sep')
-        print(f'{safe_max(g_sig_df["objid"])} objects identified by significance')
+        if len(self.filtered_sep_df) > 0:
+            print(f'{safe_max(g_filt_sep_df["objid"])} filtered objects identified by sep')
+            print(f"----- {num_candidates} asteroid candidates in filtered objects")
+            if len(data) >= 1:
+                for i in range(len(data)):
+                    print(f"---------- {data[i]}")
+            print(f'{safe_max(g_thresh_sep_df["objid"])} filtered & thresholded objects identified by sep')
+        else:
+            print('0 objects passed through filtering')
+        if len(self.significance_df) > 0:
+            print(f'{safe_max(g_sig_df["objid"])} objects identified by significance')
+        else:
+            print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw05191001001_03101_00001-seg004_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00004_mirimage_ramp.fits'
          ]
 
 for file in files:
