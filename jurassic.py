@@ -16,6 +16,14 @@ from skimage.restoration import inpaint
 import warnings
 warnings.filterwarnings("ignore")
 
+warnings.filterwarnings("ignore",
+                        message="Mean of empty slice",
+                        category=RuntimeWarning)
+
+warnings.filterwarnings("ignore",
+                        message="Degrees of freedom <= 0 for slice",
+                        category=RuntimeWarning)
+
 import logging, sys
 logging.disable(sys.maxsize)
 
@@ -261,7 +269,7 @@ class Jurassic():
         else:
             obs_name = self.filename  # fallback
 
-        obs_name = f"infill_{obs_name}" 
+        obs_name = f"{obs_name}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
@@ -379,7 +387,7 @@ class Jurassic():
         return x_dat, ramp   
 
 
-    def parallel_fit_df(self,cube,save_df=False,num_cores=35):
+    def parallel_fit_df(self,cube,save_df=False,num_cores=45):
         """
         fits all ramps of specified cube parallely
         """
@@ -580,7 +588,7 @@ class Jurassic():
         self.kernel = psf[3].data
 
     
-    def source_extracting(self,cube,save,num_cores=35):
+    def source_extracting(self,cube,save,num_cores=45):
         """
         using source extractor (sep) instead of StarFinder
         """
@@ -680,7 +688,7 @@ class Jurassic():
         np.save(filepath, self.second_ref_frame)
 
 
-    def _remove_cosmic(self,cube,num_cores=35):
+    def _remove_cosmic(self,cube,num_cores=45):
         """
         uses lacosmic to remove the cosmic rays in each frame
         """
@@ -965,6 +973,17 @@ class Jurassic():
         g_tot_sep_df.to_csv(filepath,index=False)
 
         full_file_path = os.path.join(self.grouped_dir, 'objects_summary.txt')
+        summary_path = os.path.join(self.base_dir, 'interesting_findings.txt')
+
+        with open(summary_path, "a") as summary:
+            print(f"------------------------------------------------------",file=summary)
+            print(f"{self.filename}",file=summary)
+            print(f"------------------------------------------------------",file=summary)
+            if len(data) > 0:
+                print(f"{num_candidates} asteroid candidates in filtered objects", file=summary)
+                if len(data) >= 1:
+                    for i in range(len(data)):
+                        print(f"----- {data[i]}", file=summary)
 
         with open(full_file_path, "w") as f:
             print(f"{safe_max(g_tot_sep_df['objid'])} total objects identified by sep", file=f)
@@ -998,8 +1017,10 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/jades-s/jw05279005001_03101_00004_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg006_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg007_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg008_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg009_mirimage_ramp.fits'
          ]
 
 for file in files:
