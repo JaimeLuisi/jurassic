@@ -10,19 +10,11 @@ from astropy.io import fits
 from astropy.convolution import convolve_fft
 from joblib import Parallel, delayed
 from astropy.stats import sigma_clipped_stats, sigma_clip
-from lacosmic.core import lacosmic
+from lacosmic.core import lacosmic # func is apparently deprecated - will be 'remove_cosmics'
 from skimage.restoration import inpaint
 
 import warnings
 warnings.filterwarnings("ignore")
-
-warnings.filterwarnings("ignore",
-                        message="Mean of empty slice",
-                        category=RuntimeWarning)
-
-warnings.filterwarnings("ignore",
-                        message="Degrees of freedom <= 0 for slice",
-                        category=RuntimeWarning)
 
 import logging, sys
 logging.disable(sys.maxsize)
@@ -123,7 +115,6 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir):
     obj_df['sep_flux'] = flux
     obj_df['sep_fluxerr'] = fluxerr
     obj_df['sep_s/n'] = flux/fluxerr
-    # flux/fluxerr for s/n
     obj_df['sep_flag'] = flag
 
     # apply filtering
@@ -138,8 +129,11 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir):
         matplotlib.use("Agg") # don't show em
         fig, ax = plt.subplots()
         m, s = np.mean(data_sub*mask), np.std(data_sub*mask)
-        ax.imshow(data_sub*mask, interpolation='nearest', vmin=m-s, vmax=m+s, origin='lower')
+
+        im = ax.imshow(data_sub*mask,interpolation='nearest',vmin=m-s,vmax=m+s,origin='lower')
         ax.set_title(f"Frame {frame}")
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Pixel value")
 
         for i in filtered_df.index:
             e = Ellipse(
@@ -231,6 +225,7 @@ class Jurassic():
                 self._masked_reference() # creating new mask and doing differencing again
                 self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                 self._remove_cosmic(self.diff_cube)
+                self._make_ref_cr_mask()
                 self.source_extracting(self.clean_cube,save=True)
 
             if significance:
@@ -735,7 +730,7 @@ class Jurassic():
             sig_cube[frame] = (dat[frame]-med) / std
 
         # compare with the cr ref mask and set to zero where mask is
-        sig_cube[self.cr_mask_cube] = 0
+        sig_cube[self.ref_cr_mask] = 0
         
         self.sig_cube = sig_cube
         self.bool_sig_cube = sig_cube > magic_number
@@ -796,6 +791,9 @@ class Jurassic():
         self.rolling_sum_cube = rolling_sum_cube
         self.bool_rolling_sum_cube = bool_rolling_sum_cube
 
+        filepath = os.path.join(self.obs_dir, "rolling_sum_cube.npy")
+        np.save(filepath, self.rolling_sum_cube)
+
     
     def _significance_output(self):
         """
@@ -826,11 +824,6 @@ class Jurassic():
 
         from sklearn.cluster import DBSCAN
 
-        # if df.empty:
-        #     output = df.copy()
-        #     output['objid'] = pd.Series(dtype=int)
-        #     return output
-
         output = df.copy()
 
         pos = np.column_stack([output['x'].values, output['y'].values])
@@ -848,10 +841,6 @@ class Jurassic():
         Determines if in the grouped detections there are any potential asteroids
         A potential asteroid has travelled a distance greater than 'threshold'.
         """
-        # # deal withg a no detections case
-        # if df.empty:
-        #     return 0, None
-
         num_candidates = 0
         ids = []
 
@@ -872,7 +861,6 @@ class Jurassic():
 
             dist = np.sqrt((row_max['x']-row_min['x'])**2 +
                            (row_max['y']-row_min['y'])**2)
-            # print(f'Object {id}: distance travelled = {dist:.5f} pixels')
 
             if dist > threshold:
                 num_candidates+=1
@@ -976,14 +964,15 @@ class Jurassic():
         summary_path = os.path.join(self.base_dir, 'interesting_findings.txt')
 
         with open(summary_path, "a") as summary:
-            print(f"------------------------------------------------------",file=summary)
-            print(f"{self.filename}",file=summary)
-            print(f"------------------------------------------------------",file=summary)
-            if len(data) > 0:
+            if len(self.filtered_sep_df) > 0 and len(data) > 0:
+                print(f"------------------------------------------------------",file=summary)
+                print(f"{self.filename}",file=summary)
+                print(f"------------------------------------------------------",file=summary)
                 print(f"{num_candidates} asteroid candidates in filtered objects", file=summary)
                 if len(data) >= 1:
                     for i in range(len(data)):
                         print(f"----- {data[i]}", file=summary)
+                print(" ",file=summary)
 
         with open(full_file_path, "w") as f:
             print(f"{safe_max(g_tot_sep_df['objid'])} total objects identified by sep", file=f)
@@ -1017,10 +1006,18 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg006_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg007_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg008_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01279003001_03101_00001-seg009_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00004_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00004_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00004_mirimage_ramp.fits'
          ]
 
 for file in files:
