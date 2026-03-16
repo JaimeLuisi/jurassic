@@ -176,7 +176,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,run=True,ramps=True,images=True,significance=True):
+    def __init__(self,file=None,num_cores=45,run=True,ramps=True,images=True,significance=True):
         """
         Initialise or whatevs
 
@@ -190,6 +190,7 @@ class Jurassic():
         """
 
         self.file = file
+        self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
             "F560W": 1.882,
             "F770W": 2.445,
@@ -215,11 +216,11 @@ class Jurassic():
             if images or significance: # search on image level
                 print('images')
                 self.mega_inator(self.rampy_cube)
-                self._cube_gradient(self.mega_cube_masked)
+                self._cube_gradient(self.mega_cube_masked,save=True)
                 self._reference_frame()
-                self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False)
+                self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
                 self._psf_kernel()
-                self.source_extracting(self.diff_cube,save=False)
+                self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
                 print('re-difference')
                 self._masked_reference() # creating new mask and doing differencing again
@@ -382,11 +383,11 @@ class Jurassic():
         return x_dat, ramp   
 
 
-    def parallel_fit_df(self,cube,save_df=False,num_cores=45):
+    def parallel_fit_df(self,cube,save_df=False):
         """
         fits all ramps of specified cube parallely
         """
-        fitting = Parallel(n_jobs=num_cores, verbose=0)(
+        fitting = Parallel(n_jobs=self.num_cores, verbose=0)(
             delayed(linear_fitting)(pixel,cube,self.n_int,self.n_group) for pixel in self.masked_pixels)
 
         obj_df = pd.DataFrame(fitting, columns=["row","col","gradients","intercepts","residuals"])
@@ -526,7 +527,7 @@ class Jurassic():
         self.mega_cube_masked = mega_cube_masked
 
 
-    def _cube_gradient(self,cube):
+    def _cube_gradient(self,cube,save=None):
         """
         make a gradient cube with the fakey fake frames
         """
@@ -539,6 +540,10 @@ class Jurassic():
         self.fakey_cube = fakeified_cube
 
         self.grad_cube = np.gradient(fakeified_cube,axis=0)
+
+        if save:
+            filepath = os.path.join(self.obs_dir, "grad_cube.npy")
+            np.save(filepath, self.grad_cube)
 
 
     def _reference_frame(self):
@@ -558,7 +563,7 @@ class Jurassic():
         np.save(filepath, self.first_ref_frame)
 
 
-    def _cube_differenced(self,cube,reference,save=None):
+    def _cube_differenced(self,cube,reference,save=None,first=None):
         """
         make a differenced cube from gradient cube using a median frame as reference
         """
@@ -571,6 +576,11 @@ class Jurassic():
         if save:
             filepath = os.path.join(self.obs_dir, "diff_cube.npy")
             np.save(filepath, self.diff_cube)
+
+        if first:
+            filepath = os.path.join(self.obs_dir, "diff_cube_1.npy")
+            np.save(filepath, self.diff_cube)
+
         
 
     def _psf_kernel(self,size=10):
@@ -583,15 +593,15 @@ class Jurassic():
         self.kernel = psf[3].data
 
     
-    def source_extracting(self,cube,save,num_cores=45):
+    def source_extracting(self,cube,save_plot,save_csv):
         """
         using source extractor (sep) instead of StarFinder
         """
-        tasks = (delayed(_run_sep)(frame,cube[frame],self.kernel,self.mask_tot,save,self.obs_dir)
+        tasks = (delayed(_run_sep)(frame,cube[frame],self.kernel,self.mask_tot,save_plot,self.obs_dir)
                                                     for frame in range(self.n_frame))
         
         # run sep in parallel
-        results = Parallel(n_jobs=num_cores, prefer="processes")(tasks)
+        results = Parallel(n_jobs=self.num_cores, prefer="processes")(tasks)
         obj_dfs, filtered_dfs = zip(*results)
 
         # keep only non empty dfs
@@ -615,7 +625,7 @@ class Jurassic():
               f"({len(self.filtered_sep_df)} total sources)")
 
         # save csv's of the filtered and unfiltered dfs
-        if save:
+        if save_csv:
             if len(self.filtered_sep_df) > 0:
                 filepath = os.path.join(self.obs_dir, "filtered_sources.csv")
                 self.filtered_sep_df.to_csv(filepath, index=False)
@@ -672,10 +682,6 @@ class Jurassic():
         no_nans[self.bad_frames] = False
         self.infilled = infilled.copy()[no_nans]
 
-        # saving the infilled cube
-        filepath = os.path.join(self.obs_dir, "infilled_ref_cube.npy")
-        np.save(filepath, self.infilled)
-
         # nanmedian the infilled cube and then save the resulting reference
         self.second_ref_frame = np.nanmedian(self.infilled,axis=0)
 
@@ -683,12 +689,12 @@ class Jurassic():
         np.save(filepath, self.second_ref_frame)
 
 
-    def _remove_cosmic(self,cube,num_cores=45):
+    def _remove_cosmic(self,cube):
         """
         uses lacosmic to remove the cosmic rays in each frame
         """
         # run lacosmic on each frame in parallel
-        results = Parallel(n_jobs=num_cores,verbose=0)(delayed(run_lacosmic)(cube[i],self.mask_tot) for i in range(len(cube)))
+        results = Parallel(n_jobs=self.num_cores,verbose=0)(delayed(run_lacosmic)(cube[i],self.mask_tot) for i in range(len(cube)))
         clean_cube = np.array([r[0] for r in results])
         cr_mask_cube = np.array([r[1] for r in results])
 
@@ -836,12 +842,15 @@ class Jurassic():
         return output
 
 
-    def asteroid_candidate(self, df, threshold=10):
+    def asteroid_candidate(self, df,threshold_1=10,threshold_2=5,threshold_3=2):
         """
         Determines if in the grouped detections there are any potential asteroids
         A potential asteroid has travelled a distance greater than 'threshold'.
+        Now updated to include different thresholds
         """
-        num_candidates = 0
+        num_candidates_1 = 0
+        num_candidates_2 = 0
+        num_candidates_3 = 0
         ids = []
 
         for id in range(1, df['objid'].max()+1):
@@ -862,11 +871,17 @@ class Jurassic():
             dist = np.sqrt((row_max['x']-row_min['x'])**2 +
                            (row_max['y']-row_min['y'])**2)
 
-            if dist > threshold:
-                num_candidates+=1
-                ids.append((id,row_min['x'],row_min['y']))
+            if  dist > threshold_1:
+                num_candidates_1+=1
+                ids.append((1,id,row_min['x'],row_min['y']))
+            if dist < threshold_1 and dist > threshold_2:
+                num_candidates_2+=1
+                ids.append((2,id,row_min['x'],row_min['y']))
+            if dist < threshold_2 and dist > threshold_3:
+                num_candidates_3+=1
+                ids.append((3,id,row_min['x'],row_min['y']))
 
-        return num_candidates, ids
+        return [num_candidates_1,num_candidates_2,num_candidates_3], ids
     
 
     def _time_mjd(self):
@@ -1006,18 +1021,7 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_02101_00004_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262005001_04101_00004_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/macs1149/jw01262006001_02101_00004_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177009001_03101_00001-seg001_mirimage_ramp.fits'
          ]
 
 for file in files:
