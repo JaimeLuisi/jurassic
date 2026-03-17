@@ -12,6 +12,7 @@ from joblib import Parallel, delayed
 from astropy.stats import sigma_clipped_stats, sigma_clip
 from lacosmic.core import lacosmic # func is apparently deprecated - will be 'remove_cosmics'
 from skimage.restoration import inpaint
+from sklearn.cluster import DBSCAN
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -52,12 +53,6 @@ def linear_fitting(coords,cube,n_int,n_group):
         grads.append(m)
         intercepts.append(c)
         resids.append(r[0] if len(r) > 0 else np.nan)
-
-    # resid_mean = 
-    # if n_int > 2:
-    #     resid_med = 
-    # else:
-    #     resid_med
         
     return [row, col, grads, intercepts, resids]
 
@@ -176,7 +171,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=45,run=True,ramps=True,images=True,significance=True):
+    def __init__(self,file=None,num_cores=35,run=True,ramps=True,images=True,significance=True):
         """
         Initialise or whatevs
 
@@ -227,7 +222,7 @@ class Jurassic():
                 self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                 self._remove_cosmic(self.diff_cube)
                 self._make_ref_cr_mask()
-                self.source_extracting(self.clean_cube,save=True)
+                self.source_extracting(self.clean_cube,save_plot=True,save_csv=False)
 
             if significance:
                 print('significance')
@@ -823,21 +818,42 @@ class Jurassic():
 # ------------------------------ Output stuff! ----------------------------
     
 
-    def _spatial_group(self, df, min_samples=1, distance=1, njobs=25):
+    def _spatial_group(self, df, min_samples=1, distance=1):
         """
         Groups events based on proximity w/ dbscan
         """
-
-        from sklearn.cluster import DBSCAN
-
         output = df.copy()
 
         pos = np.column_stack([output['x'].values, output['y'].values])
-        cluster = DBSCAN(eps=distance, min_samples=min_samples, n_jobs=njobs).fit(pos)
+        cluster = DBSCAN(eps=distance, min_samples=min_samples, n_jobs=self.num_cores).fit(pos)
         labels = cluster.labels_
         objid = labels + 1
         objid[objid < 0] = 0 
         output['objid'] = objid.astype(int)
+
+        return output
+    
+
+    def _temporal_group(self,df,min_samples=5,distance=2):
+        """
+        Groups events based on time w/ dbscan
+        """
+        output = pd.DataFrame()
+
+        ids = df['objid'].tolist()
+        ids_list = list(range(1,ids[-1]+1))
+
+        for id in ids_list:
+            obj_df = df[df['objid']==id]
+            # loop through each object to find each ones events
+            if len(obj_df) >= 3:
+                data = obj_df['frame'].values
+                data = data.reshape(-1, 1)
+                db = DBSCAN(eps=distance, min_samples=min_samples,n_jobs=self.num_cores).fit(data)
+                labels = db.labels_
+                obj_df['event'] = labels.astype(int)
+
+            output = pd.concat([output, obj_df], ignore_index=True)
 
         return output
 
@@ -873,15 +889,15 @@ class Jurassic():
 
             if  dist > threshold_1:
                 num_candidates_1+=1
-                ids.append((1,id,row_min['x'],row_min['y']))
+                ids.append(('Grade 1',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
             if dist < threshold_1 and dist > threshold_2:
                 num_candidates_2+=1
-                ids.append((2,id,row_min['x'],row_min['y']))
+                ids.append(('Grade 2',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
             if dist < threshold_2 and dist > threshold_3:
                 num_candidates_3+=1
-                ids.append((3,id,row_min['x'],row_min['y']))
+                ids.append(('Grade 3',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
 
-        return [num_candidates_1,num_candidates_2,num_candidates_3], ids
+        return num_candidates_1+num_candidates_2+num_candidates_3, ids
     
 
     def _time_mjd(self):
@@ -942,6 +958,7 @@ class Jurassic():
         if len(self.significance_df) > 0:
             g_sig_df = self._spatial_group(self.significance_df)
             g_sig_df = g_sig_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
+            g_sig_df = self._temporal_group(g_sig_df)
             g_sig_df = self.assign_mjd(g_sig_df)
             filepath = os.path.join(self.grouped_dir, 'grouped_significance.csv')
             g_sig_df.to_csv(filepath,index=False)
@@ -950,27 +967,29 @@ class Jurassic():
         if len(self.filtered_sep_df) > 0:
             g_filt_sep_df = self._spatial_group(self.filtered_sep_df)
             g_filt_sep_df = g_filt_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
+            g_filt_sep_df = self._temporal_group(g_filt_sep_df)
             g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
             g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
 
             num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
-            counts = Counter(g_filt_sep_df['objid'].to_numpy()) if not g_filt_sep_df.empty else Counter()
-            g_thresh_sep_df = g_filt_sep_df.copy()
-            if 'objid' not in g_thresh_sep_df.columns:
-                g_thresh_sep_df = self._spatial_group(g_thresh_sep_df)
+            # counts = Counter(g_filt_sep_df['objid'].to_numpy()) if not g_filt_sep_df.empty else Counter()
+            # g_thresh_sep_df = g_filt_sep_df.copy()
+            # if 'objid' not in g_thresh_sep_df.columns:
+            #     g_thresh_sep_df = self._spatial_group(g_thresh_sep_df)
 
-            if not g_thresh_sep_df.empty:
-                g_thresh_sep_df["obj_count"] = g_thresh_sep_df["objid"].map(counts).fillna(0).astype(int)
-                g_thresh_sep_df = g_thresh_sep_df[g_thresh_sep_df['obj_count'] >= 3]
-            else:
-                g_thresh_sep_df["obj_count"] = pd.Series(dtype=int)
+            # if not g_thresh_sep_df.empty:
+            #     g_thresh_sep_df["obj_count"] = g_thresh_sep_df["objid"].map(counts).fillna(0).astype(int)
+            #     g_thresh_sep_df = g_thresh_sep_df[g_thresh_sep_df['obj_count'] >= 3]
+            # else:
+            #     g_thresh_sep_df["obj_count"] = pd.Series(dtype=int)
 
-            g_thresh_sep_df = self.assign_mjd(g_thresh_sep_df)
-            filepath = os.path.join(self.grouped_dir, 'grouped_thresholded_sep.csv')
-            g_thresh_sep_df.to_csv(filepath,index=False)
+            # g_thresh_sep_df = self.assign_mjd(g_thresh_sep_df)
+            # filepath = os.path.join(self.grouped_dir, 'grouped_thresholded_sep.csv')
+            # g_thresh_sep_df.to_csv(filepath,index=False)
         
         g_tot_sep_df = self._spatial_group(self.total_df)
         g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
+        g_tot_sep_df = self._temporal_group(g_tot_sep_df)
         g_tot_sep_df = self.assign_mjd(g_tot_sep_df)
         filepath = os.path.join(self.grouped_dir, 'grouped_total_sep.csv')
         g_tot_sep_df.to_csv(filepath,index=False)
@@ -997,7 +1016,7 @@ class Jurassic():
                 if len(data) >= 1:
                     for i in range(len(data)):
                         print(f"---------- {data[i]}", file=f)
-                print(f"{safe_max(g_thresh_sep_df['objid'])} filtered & thresholded objects identified by sep", file=f)
+                # print(f"{safe_max(g_thresh_sep_df['objid'])} filtered & thresholded objects identified by sep", file=f)
             else:
                 print('0 objects passed through filtering', file=f)
             if len(self.significance_df) > 0:
@@ -1012,7 +1031,7 @@ class Jurassic():
             if len(data) >= 1:
                 for i in range(len(data)):
                     print(f"---------- {data[i]}")
-            print(f'{safe_max(g_thresh_sep_df["objid"])} filtered & thresholded objects identified by sep')
+            # print(f'{safe_max(g_thresh_sep_df["objid"])} filtered & thresholded objects identified by sep')
         else:
             print('0 objects passed through filtering')
         if len(self.significance_df) > 0:
