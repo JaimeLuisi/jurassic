@@ -171,7 +171,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,ramps=True,images=True,significance=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='ramp',ramps=True,images=True,significance=True):
         """
         Initialise or whatevs
 
@@ -179,12 +179,16 @@ class Jurassic():
         ----------
         file : str
                 File name of the observation
+
+        method : str
+                either 'ramp' or 'mega'
         
 
         other stuff I guess - will update at some point
         """
 
         self.file = file
+        self.method = method
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
             "F560W": 1.882,
@@ -207,29 +211,53 @@ class Jurassic():
                 print('ramps')
                 self.parallel_fit_df(self.rampy_cube) # only fitting rampy_cube not mega
                 # self.worst_fits(self.rampy_cube) # atm has 25 worst fitting pixels
-        
-            if images or significance: # search on image level
-                print('images')
-                self.mega_inator(self.rampy_cube)
-                self._cube_gradient(self.mega_cube_masked,save=True)
-                self._reference_frame()
-                self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
-                self._psf_kernel()
-                self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
-                print('re-difference')
-                self._masked_reference() # creating new mask and doing differencing again
-                self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
-                self._remove_cosmic(self.diff_cube)
-                self._make_ref_cr_mask()
-                self.source_extracting(self.clean_cube,save_plot=True,save_csv=False)
+            if self.method == 'mega':
+                if images or significance: # search on image level
+                    print('images')
+                    self.mega_inator(self.rampy_cube)
+                    self._cube_gradient(self.mega_cube_masked,save=True)
+                    self._reference_frame()
+                    self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
+                    self._psf_kernel()
+                    self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
-            if significance:
-                print('significance')
-                self._cube_significance()
-                self._cube_threshold() 
-                self._cube_rolling_sum()
-                self._significance_output()
+                    print('re-difference')
+                    self._masked_reference() # creating new mask and doing differencing again
+                    self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
+                    self._remove_cosmic(self.diff_cube)
+                    self._make_ref_cr_mask()
+                    self.source_extracting(self.clean_cube,save_plot=True,save_csv=False)
+
+                if significance:
+                    print('significance')
+                    self._cube_significance()
+                    self._cube_threshold() 
+                    self._cube_rolling_sum()
+                    self._significance_output()
+            
+            if self.method == 'ramp':
+                if images or significance: # search on image level
+                    print('images')
+                    self._cube_gradient(self.rampy_cube,save=True)
+                    self._reference_frame()
+                    self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
+                    self._psf_kernel()
+                    self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
+
+                    print('re-difference')
+                    self._masked_reference() # creating new mask and doing differencing again
+                    self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
+                    self._remove_cosmic(self.diff_cube)
+                    self._make_ref_cr_mask()
+                    self.source_extracting(self.clean_cube,save_plot=True,save_csv=False)
+
+                if significance:
+                    print('significance')
+                    self._cube_significance()
+                    self._cube_threshold() 
+                    self._cube_rolling_sum()
+                    self._significance_output()
 
             self._time_mjd()
             self.save_outputs()
@@ -274,6 +302,8 @@ class Jurassic():
         bad_frames = []
         for integration in list(range(self.n_int)):
             bad_frames.append(integration*self.n_group)
+            if self.method == 'ramp':
+                bad_frames.append(((integration+1)*self.n_group)-2)
             bad_frames.append(((integration+1)*self.n_group)-1)
         self.bad_frames = bad_frames
 
@@ -524,17 +554,24 @@ class Jurassic():
 
     def _cube_gradient(self,cube,save=None):
         """
-        make a gradient cube with the fakey fake frames
+        make a gradient cube with the fakey fake frames for mega method
+        for ramp method just takes the gradient then masks out bad frames
         """
-        fakeified_cube = cube.copy()
-        for int_num in range(self.n_int-1): # for all integrations but the last one
-            val = (int_num+1)*self.n_group
-            fakeified_cube[val-1] = 2*fakeified_cube[val-2] - fakeified_cube[val-3] # last frame of the integration
-            fakeified_cube[val] = 3*fakeified_cube[val-2] - 2*fakeified_cube[val-3] # first frame of the next integration
+        if self.method == 'mega':
+            fakeified_cube = cube.copy()
+            for int_num in range(self.n_int-1): # for all integrations but the last one
+                val = (int_num+1)*self.n_group
+                fakeified_cube[val-1] = 2*fakeified_cube[val-2] - fakeified_cube[val-3] # last frame of the integration
+                fakeified_cube[val] = 3*fakeified_cube[val-2] - 2*fakeified_cube[val-3] # first frame of the next integration
 
-        self.fakey_cube = fakeified_cube
+            self.fakey_cube = fakeified_cube
 
-        self.grad_cube = np.gradient(fakeified_cube,axis=0)
+            self.grad_cube = np.gradient(fakeified_cube,axis=0)
+
+        if self.method == 'ramp':
+            grad_cube = np.gradient(cube,axis=0)
+            grad_cube[self.bad_frames] = np.nan
+            self.grad_cube = grad_cube
 
         if save:
             filepath = os.path.join(self.obs_dir, "grad_cube.npy")
@@ -576,7 +613,6 @@ class Jurassic():
             filepath = os.path.join(self.obs_dir, "diff_cube_1.npy")
             np.save(filepath, self.diff_cube)
 
-        
 
     def _psf_kernel(self,size=10):
         """
@@ -707,7 +743,6 @@ class Jurassic():
         """
         ref_cr_mask = np.where(self.cr_mask_cube,self.jump_cube,True)
         self.ref_cr_mask = ref_cr_mask
-
 
 
 # --------------------- Significance Functions -----------------------
@@ -845,7 +880,7 @@ class Jurassic():
 
         for id in ids_list:
             obj_df = df[df['objid']==id]
-            # loop through each object to find each ones events
+            # loop through each grouped object to find events
             if len(obj_df) >= 3:
                 data = obj_df['frame'].values
                 data = data.reshape(-1, 1)
@@ -889,13 +924,13 @@ class Jurassic():
 
             if  dist > threshold_1:
                 num_candidates_1+=1
-                ids.append(('Grade 1',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
             if dist < threshold_1 and dist > threshold_2:
                 num_candidates_2+=1
-                ids.append(('Grade 2',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
             if dist < threshold_2 and dist > threshold_3:
                 num_candidates_3+=1
-                ids.append(('Grade 3',f'Object: {id}',f'Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
 
         return num_candidates_1+num_candidates_2+num_candidates_3, ids
     
@@ -972,20 +1007,6 @@ class Jurassic():
             g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
 
             num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
-            # counts = Counter(g_filt_sep_df['objid'].to_numpy()) if not g_filt_sep_df.empty else Counter()
-            # g_thresh_sep_df = g_filt_sep_df.copy()
-            # if 'objid' not in g_thresh_sep_df.columns:
-            #     g_thresh_sep_df = self._spatial_group(g_thresh_sep_df)
-
-            # if not g_thresh_sep_df.empty:
-            #     g_thresh_sep_df["obj_count"] = g_thresh_sep_df["objid"].map(counts).fillna(0).astype(int)
-            #     g_thresh_sep_df = g_thresh_sep_df[g_thresh_sep_df['obj_count'] >= 3]
-            # else:
-            #     g_thresh_sep_df["obj_count"] = pd.Series(dtype=int)
-
-            # g_thresh_sep_df = self.assign_mjd(g_thresh_sep_df)
-            # filepath = os.path.join(self.grouped_dir, 'grouped_thresholded_sep.csv')
-            # g_thresh_sep_df.to_csv(filepath,index=False)
         
         g_tot_sep_df = self._spatial_group(self.total_df)
         g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
@@ -1016,7 +1037,6 @@ class Jurassic():
                 if len(data) >= 1:
                     for i in range(len(data)):
                         print(f"---------- {data[i]}", file=f)
-                # print(f"{safe_max(g_thresh_sep_df['objid'])} filtered & thresholded objects identified by sep", file=f)
             else:
                 print('0 objects passed through filtering', file=f)
             if len(self.significance_df) > 0:
@@ -1031,7 +1051,6 @@ class Jurassic():
             if len(data) >= 1:
                 for i in range(len(data)):
                     print(f"---------- {data[i]}")
-            # print(f'{safe_max(g_thresh_sep_df["objid"])} filtered & thresholded objects identified by sep')
         else:
             print('0 objects passed through filtering')
         if len(self.significance_df) > 0:
