@@ -220,7 +220,7 @@ class Jurassic():
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
                     self._psf_kernel()
-                    self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
+                    self.source_extracting(self.diff_cube,save_plot=False,save_csv=True)
 
                     print('re-difference')
                     self._masked_reference() # creating new mask and doing differencing again
@@ -288,7 +288,7 @@ class Jurassic():
         else:
             obs_name = self.filename  # fallback
 
-        obs_name = f"{obs_name}" 
+        obs_name = f"new_infill_{obs_name}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
@@ -302,8 +302,6 @@ class Jurassic():
         bad_frames = []
         for integration in list(range(self.n_int)):
             bad_frames.append(integration*self.n_group)
-            if self.method == 'ramp':
-                bad_frames.append(((integration+1)*self.n_group)-2)
             bad_frames.append(((integration+1)*self.n_group)-1)
         self.bad_frames = bad_frames
 
@@ -664,57 +662,58 @@ class Jurassic():
             filepath = os.path.join(self.obs_dir, "all_sources.csv")
             self.total_df.to_csv(filepath, index=False)
 
-        
-    def _masked_reference(self,mask_radius=10):
+
+    def _masked_reference(self, mask_radius=10):
         """
-        Makes a reference frame (median) but masks out any variable sources
-        Should probably infill with median of an annulus around the maksed sources
-        but that's hard to think about rn
+        Makes a reference frame (median) but masks out variable sources.
+        Infills masked pixels using the temporal median of unmasked frames
+        at that pixel, so asteroid flux never contaminates the reference.
         """
-        if self.filtered_sep_df.empty: # hope to counteract the errors of no cols in df
-            self.reference_cube = np.zeros_like(self.grad_cube)
-            self.reference_cube_bool = np.zeros_like(self.grad_cube, dtype=bool)
+        if self.filtered_sep_df.empty:
             self.second_ref_frame = self.first_ref_frame.copy()
             return
 
+        # source masks for each frame
         reference_cube = np.zeros_like(self.grad_cube)
         for frame in self.frames:
             if frame in self.filtered_sep_df['frame'].values:
                 mask = np.zeros_like(self.grad_cube[0])
 
-                frame_df = self.filtered_sep_df[self.filtered_sep_df['frame']==frame]
-                x_float = frame_df['x'].values
-                x_int = [round(x) for x in x_float]
-                y_float = frame_df['y'].values
-                y_int = [round(y) for y in y_float]
+                frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
+                x_int = [round(x) for x in frame_df['x'].values]
+                y_int = [round(y) for y in frame_df['y'].values]
 
                 for i in range(len(x_int)):
-                    mask[y_int[i],x_int[i]] = 1 # centre of each detected source is now one
+                    mask[y_int[i], x_int[i]] = 1
 
                 kernel = self._circle_app(mask_radius)
-                mask_conv = convolve_fft(mask, kernel) # convolving each source
-                reference_cube[frame] = mask_conv
-        
-        self.reference_cube = reference_cube 
-        self.reference_cube_bool = reference_cube >= 0.00001
+                reference_cube[frame] = convolve_fft(mask, kernel)
 
-        # infilling the naned regions
-        infilled = np.zeros_like(self.reference_cube)
+        source_mask = reference_cube >= 0.00001  
 
-        for i in range(len(self.reference_cube)):
-            image = self.grad_cube[i].copy()
-            image[self.reference_cube_bool[i]] = np.nan # image is the grad cube frame with detected sources masked
-            mask = self.reference_cube_bool[i]
-            result = inpaint.inpaint_biharmonic(image,mask)
-            infilled[i] = result
-
-        # making sure to only use the 'good' frames (not fake or all nan frames)
-        no_nans = np.nansum(self.grad_cube,axis=(1,2)) > 0
+        # only use good frames
+        no_nans = np.nansum(self.grad_cube, axis=(1, 2)) > 0
         no_nans[self.bad_frames] = False
-        self.infilled = infilled.copy()[no_nans]
 
-        # nanmedian the infilled cube and then save the resulting reference
-        self.second_ref_frame = np.nanmedian(self.infilled,axis=0)
+        good_slices = self.grad_cube.copy()[no_nans]
+        mask_slices = source_mask.copy()[no_nans]
+
+        # Temporal infilling:
+        # For each pixel position, compute the median only from frames
+        # where that pixel is NOT masked by a source.
+        # Then use that value to fill masked positions before the final median.
+        unmasked_slices = np.where(mask_slices, np.nan, good_slices)
+
+        # temporal median at every pixel, ignoring frames where source was present
+        temporal_median = np.nanmedian(unmasked_slices, axis=0) 
+
+        # infill: replace masked pixels in each frame with the temporal median
+        infilled = unmasked_slices.copy()
+        for i in range(len(infilled)):
+            frame_mask = mask_slices[i]
+            infilled[i][frame_mask] = temporal_median[frame_mask]
+
+        self.second_ref_frame = np.nanmedian(infilled, axis=0)
 
         filepath = os.path.join(self.obs_dir, "second_reference_frame.npy")
         np.save(filepath, self.second_ref_frame)
@@ -1059,8 +1058,8 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177009001_03101_00001-seg001_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg005_mirimage_ramp.fits'
          ]
 
 for file in files:
-    Jurassic(file)
+    Jurassic(file,method='mega',num_cores=35)
