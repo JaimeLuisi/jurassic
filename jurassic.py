@@ -56,6 +56,100 @@ def linear_fitting(coords,cube,n_int,n_group):
         
     return [row, col, grads, intercepts, resids]
 
+# ------- new stuff for ramp correction -----
+
+def build_correction_map(cube, mask=None):
+    """
+    Derive the per-pixel group correction map from a ramp cube.
+    C_map[-2] = 1 everywhere (second-to-last group is the reference).
+    C_map[-1] = NaN everywhere (last gradient is reset-contaminated).
+
+    Parameters
+    ----------
+    cube : ndarray, shape (n_int, n_groups, ny, nx)
+        Raw 4D ramp cube (before reshaping to frame-indexed format).
+    mask : ndarray, shape (ny, nx), bool, optional
+        True = bad pixels to interpolate over.
+
+    Returns
+    -------
+    C_map : ndarray, shape (n_groups-1, ny, nx)
+    """
+    from scipy.interpolate import griddata
+
+    grads = np.diff(cube, axis=1).astype(float)
+    med_grad = np.nanmedian(grads, axis=0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        C_map = np.where(med_grad != 0, med_grad[-2:-1] / med_grad, np.nan)
+
+    # last gradient is reset-contaminated, cannot correct that
+    C_map[-1] = np.nan
+
+    if mask is not None:
+        ny, nx = mask.shape
+        yy, xx = np.mgrid[0:ny, 0:nx]
+
+        valid_for_good = np.ones(C_map.shape[0], dtype=bool)
+        valid_for_good[-1] = False
+
+        good = ~mask & np.isfinite(C_map[0])
+        good_yx = np.column_stack([yy[good], xx[good]])
+
+        for g in range(C_map.shape[0]):
+            if not valid_for_good[g]:
+                continue
+            needs_fill = mask | ~np.isfinite(C_map[g])
+            if not needs_fill.any():
+                continue
+            fill_yx = np.column_stack([yy[needs_fill], xx[needs_fill]])
+            good_vals = C_map[g][good]
+            filled = griddata(good_yx, good_vals, fill_yx, method='linear')
+            still_nan = ~np.isfinite(filled)
+            if still_nan.any():
+                filled[still_nan] = griddata(
+                    good_yx, good_vals, fill_yx[still_nan], method='nearest'
+                )
+            C_map[g][needs_fill] = filled
+
+    return C_map
+
+
+def reshape_correction_map(C_map, n_int, n_groups):
+    """
+    Reshape C_map from (n_groups-1, ny, nx) to (n_frames, ny, nx)
+    to match JURASSIC's frame-indexed rampy_cube format.
+    Bad frames (first and last of each integration) are set to NaN.
+
+    Parameters
+    ----------
+    C_map : ndarray, shape (n_groups-1, ny, nx)
+    n_int : int
+    n_groups : int
+
+    Returns
+    -------
+    C_map_frames : ndarray, shape (n_frames, ny, nx)
+    """
+    ny, nx = C_map.shape[1], C_map.shape[2]
+
+    # pad with NaN at position 0 to align gradient index g with frame index g
+    C_map_padded = np.concatenate([np.full((1, ny, nx), np.nan), C_map], axis=0)
+
+    # tile across integrations
+    C_map_frames = np.tile(C_map_padded, (n_int, 1, 1))
+
+    # NaN out bad frames
+    for integration in range(n_int):
+        first = integration * n_groups
+        last  = (integration + 1) * n_groups - 1
+        C_map_frames[first] = np.nan
+        C_map_frames[last]  = np.nan
+
+    return C_map_frames
+
+# -------------------------------
+
 
 def run_lacosmic(frame_data, mask):
     """
@@ -171,7 +265,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,method='ramp',ramps=True,images=True,significance=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='ramp',ramps=None,images=True,significance=True):
         """
         Initialise or whatevs
 
@@ -205,16 +299,20 @@ class Jurassic():
         if run:
             self._assign_data()
             self._make_cubes()
+            self.rampy_cube_raw = self.rampy_cube.copy()
             self._mask_pixels()
 
             if ramps: # search on ramp level
                 print('ramps')
                 self.parallel_fit_df(self.rampy_cube) # only fitting rampy_cube not mega
-                # self.worst_fits(self.rampy_cube) # atm has 25 worst fitting pixels
 
             if self.method == 'mega':
                 if images or significance: # search on image level
                     print('images')
+                    self._build_correction(self.data)
+                    if self.C_map_frames is not None:
+                        self.rampy_cube = self.rampy_cube_raw.copy()
+                        self.rampy_cube = self.rampy_cube * self.C_map_frames
                     self.mega_inator(self.rampy_cube)
                     self._cube_gradient(self.mega_cube_masked,save=True)
                     self._reference_frame()
@@ -223,7 +321,13 @@ class Jurassic():
                     self.source_extracting(self.diff_cube,save_plot=False,save_csv=True)
 
                     print('re-difference')
-                    self._masked_reference() # creating new mask and doing differencing again
+                    self._masked_correction()
+                    if self.C_map_frames is not None:
+                        self.rampy_cube = self.rampy_cube_raw.copy() # correction applying to not-corrected rampy cube
+                        self.rampy_cube = self.rampy_cube * self.C_map_frames
+                        self.mega_inator(self.rampy_cube)  # rebuild mega_cube with corrected ramps
+                        self._cube_gradient(self.mega_cube_masked, save=False)
+                    self._masked_reference() # creating new mask and doing differencing again w/ corrected ramps
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
                     self._make_ref_cr_mask()
@@ -239,6 +343,10 @@ class Jurassic():
             if self.method == 'ramp':
                 if images or significance: # search on image level
                     print('images')
+                    self._build_correction(self.data)
+                    if self.C_map_frames is not None:
+                        self.rampy_cube = self.rampy_cube_raw.copy()
+                        self.rampy_cube = self.rampy_cube * self.C_map_frames
                     self._cube_gradient(self.rampy_cube,save=True)
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
@@ -246,6 +354,11 @@ class Jurassic():
                     self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
                     print('re-difference')
+                    self._masked_correction()
+                    if self.C_map_frames is not None:
+                        self.rampy_cube = self.rampy_cube_raw.copy() # correction applying to not-corrected rampy cube
+                        self.rampy_cube = self.rampy_cube * self.C_map_frames
+                        self._cube_gradient(self.rampy_cube,save=True)
                     self._masked_reference() # creating new mask and doing differencing again
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -261,6 +374,9 @@ class Jurassic():
 
             self._time_mjd()
             self.save_outputs()
+
+            if not hasattr(self, 'significance_df'):
+                self.significance_df = pd.DataFrame()
 
 
     def _assign_data(self):
@@ -288,7 +404,7 @@ class Jurassic():
         else:
             obs_name = self.filename  # fallback
 
-        obs_name = f"new_infill_{obs_name}" 
+        obs_name = f"c_{obs_name}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
@@ -391,6 +507,30 @@ class Jurassic():
         pixel_mask = self.mask_tot.flatten(order='C').tolist() # flattening mask to make same size/dimensions as the list of pixel coords
         self.masked_pixels = [pixel for pixel, m in zip(pixels, pixel_mask) if m]
 
+    
+    def _build_correction(self,cube):
+        """
+        Builds a correction map from the current observation and saves it,
+        overwriting any existing map for this (filter, subarray, n_group)
+        combination. If building fails, pipeline continues uncorrected.
+
+        Sets
+        ----
+        self.C_map_frames : ndarray, shape (n_frames, ny, nx), or None
+        """
+        try:
+            mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
+            C_map = build_correction_map(cube, mask=mask)
+        except Exception as e:
+            print(f"Warning: correction map build failed ({e}). Skipping correction.")
+            self.C_map_frames = None
+            return
+
+        self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
+
+        filepath = os.path.join(self.obs_dir, "c_map_1.npy")
+        np.save(filepath, self.C_map_frames)
+
 
     def _pixel_integration(self,cube,int_num,row,col):
         """
@@ -441,69 +581,6 @@ class Jurassic():
             return 1, int(np.argmax(vals))  # 1 and first z index
         else:
             return 0, None
-
-
-    # def worst_fits(self, cube, num=15, require_jump=False):
-    #     """
-    #     Get worst fits by max_residual. Can filter based on jump status: (require_jump=True/False) or not
-    #     """
-    #     # add coords, jump, and jump_frame columns to obj_df
-    #     self.obj_df['coords'] = self.obj_df.apply(lambda row: (row['row'], row['col']), axis=1)
-    #     self.obj_df[['jump', 'jump_frame']] = self.obj_df['coords'].apply(lambda c: pd.Series(self._check_jump(c)))
-
-    #     # sort by residual
-    #     self.worst_fits_df = self.obj_df.sort_values(by='max_residual',ascending=False)
-
-    #     # filter by if jump or not
-    #     if require_jump is True:
-    #         subdf = self.worst_fits_df[self.worst_fits_df['jump'] == 1].head(num).copy()
-    #     elif require_jump is False:
-    #         subdf = self.worst_fits_df[self.worst_fits_df['jump'] == 0].head(num).copy()
-    #     else:
-    #         subdf = self.worst_fits_df.head(num).copy()
-
-    #     self.jump_fit_df = subdf
-
-    #     rows = subdf['row'].values 
-    #     cols = subdf['col'].values
-    #     grads = subdf['gradients'].values
-    #     cepts = subdf['intercepts'].values
-    #     resids = subdf['residuals'].values
-
-    #     plt.figure(constrained_layout=True, figsize=(16, 12))
-
-    #     for i in range(len(cols)):
-    #         ax = plt.subplot(5, 3, i + 1)
-    #         row, col = rows[i], cols[i]
-
-    #         for int_num in range(self.n_int):
-    #             x, y = self._pixel_integration(cube, int_num, row, col)
-    #             x, y = np.asarray(x, float), np.asarray(y, float)
-
-    #             # remove first and last points
-    #             x[[0, -1]] = np.nan
-    #             y[[0, -1]] = np.nan
-
-    #             mask = np.isfinite(y)
-    #             x, y = x[mask], y[mask]
-
-    #             # plot the data
-    #             ax.scatter(x, y, c='tab:blue', s=5)
-
-    #             # line fit
-    #             m, c, r = grads[i][int_num], cepts[i][int_num], resids[i][int_num]
-    #             y_line = self._line(m, c, x)
-    #             ax.plot(x, y_line, label=f'r={r:.2f}')
-
-    #         ax.set_title(f'Pixel ({row},{col}) | jump={subdf.iloc[i]['jump']}, frame={subdf.iloc[i]['jump_frame']}')
-    #         ax.set_xlabel('Frame')
-    #         ax.set_ylabel('Counts')
-    #         ax.legend()
-
-    #     plt.suptitle('Bad pixel ramps')
-    #     filepath = os.path.join(self.obs_dir, 'worst_fits.png')
-    #     plt.savefig(filepath, dpi=300)
-    #     plt.show()
 
 
 # --------------------- Image Search -----------------------
@@ -561,9 +638,7 @@ class Jurassic():
                 val = (int_num+1)*self.n_group
                 fakeified_cube[val-1] = 2*fakeified_cube[val-2] - fakeified_cube[val-3] # last frame of the integration
                 fakeified_cube[val] = 3*fakeified_cube[val-2] - 2*fakeified_cube[val-3] # first frame of the next integration
-
             self.fakey_cube = fakeified_cube
-
             self.grad_cube = np.gradient(fakeified_cube,axis=0)
 
         if self.method == 'ramp':
@@ -663,6 +738,56 @@ class Jurassic():
             self.total_df.to_csv(filepath, index=False)
 
 
+    def _masked_correction(self, mask_radius=10):
+        """
+        Rebuilds the correction map from self.data (4d ramps) but with detected variable
+        sources masked out so variable source flux doesn't bias the correction.
+
+        Uses og c_map if no variable sources detected with first pass
+        """
+        if self.filtered_sep_df.empty:
+            print("No sources detected — reusing first-pass correction map.")
+            return
+
+        # build a 4D source mask matching self.data shape (n_int, n_groups, ny, nx)
+        # any group within an integration where a source was detected gets masked
+        ny, nx = self.data.shape[-2], self.data.shape[-1]
+        kernel = self._circle_app(mask_radius)
+
+        # making masks for frames with detected sources
+        source_mask_2d = np.zeros((self.n_frame, ny, nx), dtype=bool)
+        detected_frames = set(self.filtered_sep_df['frame'].values)
+
+        for frame in detected_frames:
+            spatial_mask = np.zeros((ny, nx))
+            frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
+            for _, row in frame_df.iterrows():
+                spatial_mask[round(row['y']), round(row['x'])] = 1
+            convolved = convolve_fft(spatial_mask, kernel)
+            source_mask_2d[frame] = convolved >= 0.00001
+
+        # reshape source_mask_2d to 4D (n_int, n_groups, ny, nx) to match self.data
+        # any integration that contains a masked frame gets that group masked
+        source_mask_4d = source_mask_2d.reshape(self.n_int, self.n_group, ny, nx)
+
+        # mask detected source pixels in the raw data before building correction
+        masked_data = self.data.astype(float).copy()
+        masked_data[source_mask_4d] = np.nan
+
+        try:
+            mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
+            C_map = build_correction_map(masked_data, mask=mask)
+        except Exception as e:
+            print(f"Warning: second-pass correction map build failed ({e}). Reusing first-pass map.")
+            return
+
+        self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
+        print("Second-pass ramp correction map built with sources masked.")
+
+        filepath = os.path.join(self.obs_dir, "c_map_2.npy")
+        np.save(filepath, self.C_map_frames)
+
+
     def _masked_reference(self, mask_radius=10):
         """
         Makes a reference frame (median) but masks out variable sources.
@@ -675,8 +800,10 @@ class Jurassic():
 
         # source masks for each frame
         reference_cube = np.zeros_like(self.grad_cube)
+        kernel = self._circle_app(mask_radius)
+        detected_frames = set(self.filtered_sep_df['frame'].values)
         for frame in self.frames:
-            if frame in self.filtered_sep_df['frame'].values:
+            if frame in detected_frames:
                 mask = np.zeros_like(self.grad_cube[0])
 
                 frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
@@ -686,7 +813,6 @@ class Jurassic():
                 for i in range(len(x_int)):
                     mask[y_int[i], x_int[i]] = 1
 
-                kernel = self._circle_app(mask_radius)
                 reference_cube[frame] = convolve_fft(mask, kernel)
 
         source_mask = reference_cube >= 0.00001  
@@ -740,7 +866,7 @@ class Jurassic():
         makes a cosmic ray mask that is a union of the lacosmic cr_mask
         and the JWST pipeline jump detections from the dq array
         """
-        ref_cr_mask = np.where(self.cr_mask_cube,self.jump_cube,True)
+        ref_cr_mask = self.cr_mask_cube | self.jump_cube
         self.ref_cr_mask = ref_cr_mask
 
 
@@ -872,6 +998,9 @@ class Jurassic():
         """
         Groups events based on time w/ dbscan
         """
+        if df.empty:
+            return df
+
         output = pd.DataFrame()
 
         ids = df['objid'].tolist()
@@ -1005,7 +1134,10 @@ class Jurassic():
             g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
             g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
 
-            num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
+            num_candidates, data = 0, [] # incase filtered_sep_df is empty
+            if len(self.filtered_sep_df) > 0:
+                num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
+
         
         g_tot_sep_df = self._spatial_group(self.total_df)
         g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'],ascending=[True, True])
@@ -1058,7 +1190,13 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg005_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg004_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg005_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg006_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg007_mirimage_ramp.fits'
          ]
 
 for file in files:
