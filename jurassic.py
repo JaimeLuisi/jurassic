@@ -173,7 +173,7 @@ def run_lacosmic(frame_data, mask):
 
     return clean, crmask
 
-def _run_sep(frame, data, kernel, mask, save, obs_dir):
+def _run_sep(frame, data, kernel, mask, save, obs_dir,n_group):
     """
     run source extractor in parallel
     """
@@ -198,6 +198,7 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir):
     # adding needed cols
     obj_df['symmetry'] = (obj_df['a']/obj_df['b']).abs() - 1
     obj_df['frame'] = frame
+    obj_df['group'] = (obj_df['frame'] % n_group) + 1 # adding the group number
 
     # aperture photometry
     flux, fluxerr, flag = sep.sum_circle(data_sub, obj_df['x'], obj_df['y'], 3.0, err=bkg.globalrms, gain=1.0) # ap radius = 3.0
@@ -307,31 +308,31 @@ class Jurassic():
                 self.parallel_fit_df(self.rampy_cube) # only fitting rampy_cube not mega
 
             if self.method == 'mega':
-                if images or significance: # search on image level
+                if images or significance:
                     print('images')
                     self._build_correction(self.data)
+                    self.mega_inator(self.rampy_cube)          # use raw rampy_cube
+                    self._cube_gradient(self.mega_cube_masked, save=True)
+                    # apply correction to grad_cube directly
                     if self.C_map_frames is not None:
-                        self.rampy_cube = self.rampy_cube_raw.copy()
-                        self.rampy_cube = self.rampy_cube * self.C_map_frames
-                    self.mega_inator(self.rampy_cube)
-                    self._cube_gradient(self.mega_cube_masked,save=True)
+                        self.grad_cube = self.grad_cube * self.C_map_frames
+                        print(f"grad_cube finite fraction after correction: {np.isfinite(self.grad_cube).mean():.3f}")
+                        print(f"grad_cube std after correction: {np.nanstd(self.grad_cube):.6f}")
                     self._reference_frame()
-                    self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
+                    self._cube_differenced(self.grad_cube, self.first_ref_frame, save=False, first=None)
                     self._psf_kernel()
-                    self.source_extracting(self.diff_cube,save_plot=False,save_csv=True)
+                    self.source_extracting(self.diff_cube, save_plot=False, save_csv=True)
 
                     print('re-difference')
                     self._masked_correction()
+                    self._cube_gradient(self.mega_cube_masked, save=False)  # recompute from same mega_cube
                     if self.C_map_frames is not None:
-                        self.rampy_cube = self.rampy_cube_raw.copy() # correction applying to not-corrected rampy cube
-                        self.rampy_cube = self.rampy_cube * self.C_map_frames
-                        self.mega_inator(self.rampy_cube)  # rebuild mega_cube with corrected ramps
-                        self._cube_gradient(self.mega_cube_masked, save=False)
-                    self._masked_reference() # creating new mask and doing differencing again w/ corrected ramps
-                    self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
+                        self.grad_cube = self.grad_cube * self.C_map_frames
+                    self._masked_reference()
+                    self._cube_differenced(self.grad_cube, self.second_ref_frame, save=True)
                     self._remove_cosmic(self.diff_cube)
                     self._make_ref_cr_mask()
-                    self.source_extracting(self.clean_cube,save_plot=True,save_csv=False)
+                    self.source_extracting(self.clean_cube, save_plot=True, save_csv=False)
 
                 if significance:
                     print('significance')
@@ -347,6 +348,8 @@ class Jurassic():
                     if self.C_map_frames is not None:
                         self.rampy_cube = self.rampy_cube_raw.copy()
                         self.rampy_cube = self.rampy_cube * self.C_map_frames
+                        print(f"Correction applied. rampy_cube finite fraction: {np.isfinite(self.rampy_cube).mean():.3f}")
+                        print(f"C_map_frames finite fraction: {np.isfinite(self.C_map_frames).mean():.3f}")
                     self._cube_gradient(self.rampy_cube,save=True)
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
@@ -359,6 +362,8 @@ class Jurassic():
                         self.rampy_cube = self.rampy_cube_raw.copy() # correction applying to not-corrected rampy cube
                         self.rampy_cube = self.rampy_cube * self.C_map_frames
                         self._cube_gradient(self.rampy_cube,save=True)
+                        print(f"Correction applied. rampy_cube finite fraction: {np.isfinite(self.rampy_cube).mean():.3f}")
+                        print(f"C_map_frames finite fraction: {np.isfinite(self.C_map_frames).mean():.3f}")
                     self._masked_reference() # creating new mask and doing differencing again
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -518,9 +523,15 @@ class Jurassic():
         ----
         self.C_map_frames : ndarray, shape (n_frames, ny, nx), or None
         """
+        # self.C_map_frames = None  # temporarily disabled for diagnosis
+        # return
         try:
             mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
+            print(f"mask_tot science fraction: {self.mask_tot.mean():.3f}")
+            print(f"mask passed to build_correction: {(~self.mask_tot).mean():.3f}")
             C_map = build_correction_map(cube, mask=mask)
+            print(f"C_map shape: {C_map.shape}, finite fraction: {np.isfinite(C_map).mean():.3f}")
+            print(f"C_map per-slice finite fractions: {[round(np.isfinite(C_map[g]).mean(), 3) for g in range(C_map.shape[0])]}")
         except Exception as e:
             print(f"Warning: correction map build failed ({e}). Skipping correction.")
             self.C_map_frames = None
@@ -701,7 +712,7 @@ class Jurassic():
         """
         using source extractor (sep) instead of StarFinder
         """
-        tasks = (delayed(_run_sep)(frame,cube[frame],self.kernel,self.mask_tot,save_plot,self.obs_dir)
+        tasks = (delayed(_run_sep)(frame,cube[frame],self.kernel,self.mask_tot,save_plot,self.obs_dir,self.n_group)
                                                     for frame in range(self.n_frame))
         
         # run sep in parallel
@@ -982,6 +993,10 @@ class Jurassic():
         """
         Groups events based on proximity w/ dbscan
         """
+        if df.empty:
+            df['objid'] = pd.Series(dtype=int)
+            return df
+        
         output = df.copy()
 
         pos = np.column_stack([output['x'].values, output['y'].values])
@@ -1127,16 +1142,14 @@ class Jurassic():
             g_sig_df.to_csv(filepath,index=False)
 
         # filtered sep sources (grouped)
+        num_candidates, data = 0, []
         if len(self.filtered_sep_df) > 0:
             g_filt_sep_df = self._spatial_group(self.filtered_sep_df)
             g_filt_sep_df = g_filt_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
             g_filt_sep_df = self._temporal_group(g_filt_sep_df)
             g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
             g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
-
-            num_candidates, data = 0, [] # incase filtered_sep_df is empty
-            if len(self.filtered_sep_df) > 0:
-                num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
+            num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
 
         
         g_tot_sep_df = self._spatial_group(self.total_df)
