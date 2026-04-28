@@ -318,6 +318,7 @@ class Jurassic():
                         self.grad_cube = self.grad_cube * self.C_map_frames
                         print(f"grad_cube finite fraction after correction: {np.isfinite(self.grad_cube).mean():.3f}")
                         print(f"grad_cube std after correction: {np.nanstd(self.grad_cube):.6f}")
+                        # save the corrected grad_cube here
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube, self.first_ref_frame, save=False, first=None)
                     self._psf_kernel()
@@ -801,20 +802,19 @@ class Jurassic():
 
     def _masked_reference(self, mask_radius=10):
         """
-        Makes a reference frame (median) but masks out variable sources.
-        Infills masked pixels using the temporal median of unmasked frames
-        at that pixel, so asteroid flux never contaminates the reference.
+        Makes a reference frame (median) but masks out any variable sources.
+        Masks detected source positions and takes nanmedian of remaining pixels.
         """
         if self.filtered_sep_df.empty:
             self.second_ref_frame = self.first_ref_frame.copy()
             return
 
-        # source masks for each frame
+        # source masks for each frame with detected variables
         reference_cube = np.zeros_like(self.grad_cube)
         kernel = self._circle_app(mask_radius)
-        detected_frames = set(self.filtered_sep_df['frame'].values)
+
         for frame in self.frames:
-            if frame in detected_frames:
+            if frame in self.filtered_sep_df['frame'].values:
                 mask = np.zeros_like(self.grad_cube[0])
 
                 frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
@@ -826,31 +826,18 @@ class Jurassic():
 
                 reference_cube[frame] = convolve_fft(mask, kernel)
 
-        source_mask = reference_cube >= 0.00001  
+        source_mask = reference_cube >= 0.00001  # boolean: True = source pixel to exclude
 
-        # only use good frames
+        # Only use good frames (not bad/all-NaN)
         no_nans = np.nansum(self.grad_cube, axis=(1, 2)) > 0
         no_nans[self.bad_frames] = False
 
         good_slices = self.grad_cube.copy()[no_nans]
-        mask_slices = source_mask.copy()[no_nans]
+        mask_slices = source_mask[no_nans]
 
-        # Temporal infilling:
-        # For each pixel position, compute the median only from frames
-        # where that pixel is NOT masked by a source.
-        # Then use that value to fill masked positions before the final median.
-        unmasked_slices = np.where(mask_slices, np.nan, good_slices)
-
-        # temporal median at every pixel, ignoring frames where source was present
-        temporal_median = np.nanmedian(unmasked_slices, axis=0) 
-
-        # infill: replace masked pixels in each frame with the temporal median
-        infilled = unmasked_slices.copy()
-        for i in range(len(infilled)):
-            frame_mask = mask_slices[i]
-            infilled[i][frame_mask] = temporal_median[frame_mask]
-
-        self.second_ref_frame = np.nanmedian(infilled, axis=0)
+        # NaN out source pixels, then make reference from median
+        masked_slices = np.where(mask_slices, np.nan, good_slices)
+        self.second_ref_frame = np.nanmedian(masked_slices, axis=0)
 
         filepath = os.path.join(self.obs_dir, "second_reference_frame.npy")
         np.save(filepath, self.second_ref_frame)
@@ -1203,14 +1190,17 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg004_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg005_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg006_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw02304001001_03101_00001-seg007_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg004_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg005_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg006_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg007_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg008_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg010_mirimage_ramp.fits'
          ]
 
 for file in files:
-    Jurassic(file,method='mega',num_cores=35)
+    Jurassic(file,method='mega',num_cores=55)
