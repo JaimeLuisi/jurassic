@@ -266,7 +266,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,method='ramp',ramps=None,images=True,significance=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True):
         """
         Initialise or whatevs
 
@@ -284,6 +284,7 @@ class Jurassic():
 
         self.file = file
         self.method = method
+        self.mask_correction = mask_correction
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
             "F560W": 1.882,
@@ -300,7 +301,6 @@ class Jurassic():
         if run:
             self._assign_data()
             self._make_cubes()
-            self.rampy_cube_raw = self.rampy_cube.copy()
             self._mask_pixels()
 
             if ramps: # search on ramp level
@@ -310,15 +310,8 @@ class Jurassic():
             if self.method == 'mega':
                 if images or significance:
                     print('images')
-                    self._build_correction(self.data)
                     self.mega_inator(self.rampy_cube)          # use raw rampy_cube
                     self._cube_gradient(self.mega_cube_masked, save=True)
-                    # apply correction to grad_cube directly
-                    if self.C_map_frames is not None:
-                        self.grad_cube = self.grad_cube * self.C_map_frames
-                        print(f"grad_cube finite fraction after correction: {np.isfinite(self.grad_cube).mean():.3f}")
-                        print(f"grad_cube std after correction: {np.nanstd(self.grad_cube):.6f}")
-                        # save the corrected grad_cube here
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube, self.first_ref_frame, save=False, first=None)
                     self._psf_kernel()
@@ -326,10 +319,11 @@ class Jurassic():
 
                     print('re-difference')
                     self._masked_correction()
+                    # put flux calibration in here
                     self._cube_gradient(self.mega_cube_masked, save=False)  # recompute from same mega_cube
                     if self.C_map_frames is not None:
                         self.grad_cube = self.grad_cube * self.C_map_frames
-                    self._masked_reference()
+                    self._masked_reference(self.mask_correction)
                     self._cube_differenced(self.grad_cube, self.second_ref_frame, save=True)
                     self._remove_cosmic(self.diff_cube)
                     self._make_ref_cr_mask()
@@ -345,12 +339,6 @@ class Jurassic():
             if self.method == 'ramp':
                 if images or significance: # search on image level
                     print('images')
-                    self._build_correction(self.data)
-                    if self.C_map_frames is not None:
-                        self.rampy_cube = self.rampy_cube_raw.copy()
-                        self.rampy_cube = self.rampy_cube * self.C_map_frames
-                        print(f"Correction applied. rampy_cube finite fraction: {np.isfinite(self.rampy_cube).mean():.3f}")
-                        print(f"C_map_frames finite fraction: {np.isfinite(self.C_map_frames).mean():.3f}")
                     self._cube_gradient(self.rampy_cube,save=True)
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube,self.first_ref_frame,save=False,first=None) # first saves first iteration of difference cube  
@@ -359,13 +347,11 @@ class Jurassic():
 
                     print('re-difference')
                     self._masked_correction()
+                    # put flux calibration in here
                     if self.C_map_frames is not None:
-                        self.rampy_cube = self.rampy_cube_raw.copy() # correction applying to not-corrected rampy cube
                         self.rampy_cube = self.rampy_cube * self.C_map_frames
-                        self._cube_gradient(self.rampy_cube,save=True)
-                        print(f"Correction applied. rampy_cube finite fraction: {np.isfinite(self.rampy_cube).mean():.3f}")
-                        print(f"C_map_frames finite fraction: {np.isfinite(self.C_map_frames).mean():.3f}")
-                    self._masked_reference() # creating new mask and doing differencing again
+                        self._cube_gradient(self.rampy_cube,save=False)
+                    self._masked_reference(self.mask_correction) # creating new mask and doing differencing again
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
                     self._make_ref_cr_mask()
@@ -410,7 +396,7 @@ class Jurassic():
         else:
             obs_name = self.filename  # fallback
 
-        obs_name = f"c_{obs_name}" 
+        obs_name = f"c2m_{obs_name}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
@@ -524,13 +510,11 @@ class Jurassic():
         ----
         self.C_map_frames : ndarray, shape (n_frames, ny, nx), or None
         """
-        # self.C_map_frames = None  # temporarily disabled for diagnosis
-        # return
         try:
-            mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
+            # mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
             print(f"mask_tot science fraction: {self.mask_tot.mean():.3f}")
-            print(f"mask passed to build_correction: {(~self.mask_tot).mean():.3f}")
-            C_map = build_correction_map(cube, mask=mask)
+            # print(f"mask passed to build_correction: {(~self.mask_tot).mean():.3f}")
+            C_map = build_correction_map(cube)
             print(f"C_map shape: {C_map.shape}, finite fraction: {np.isfinite(C_map).mean():.3f}")
             print(f"C_map per-slice finite fractions: {[round(np.isfinite(C_map[g]).mean(), 3) for g in range(C_map.shape[0])]}")
         except Exception as e:
@@ -676,7 +660,7 @@ class Jurassic():
 
         self.first_ref_frame = np.nanmedian(good_slices,axis=0)
 
-        filepath = os.path.join(self.obs_dir, "first_reference_frame.npy")
+        filepath = os.path.join(self.obs_dir, "ref_frame_1.npy")
         np.save(filepath, self.first_ref_frame)
 
 
@@ -754,63 +738,17 @@ class Jurassic():
         """
         Rebuilds the correction map from self.data (4d ramps) but with detected variable
         sources masked out so variable source flux doesn't bias the correction.
-
-        Uses og c_map if no variable sources detected with first pass
         """
-        if self.filtered_sep_df.empty:
-            print("No sources detected — reusing first-pass correction map.")
-            return
+        filepath = os.path.join(self.obs_dir, "c_map.npy")
 
-        # build a 4D source mask matching self.data shape (n_int, n_groups, ny, nx)
-        # any group within an integration where a source was detected gets masked
-        ny, nx = self.data.shape[-2], self.data.shape[-1]
-        kernel = self._circle_app(mask_radius)
-
-        # making masks for frames with detected sources
-        source_mask_2d = np.zeros((self.n_frame, ny, nx), dtype=bool)
-        detected_frames = set(self.filtered_sep_df['frame'].values)
-
-        for frame in detected_frames:
-            spatial_mask = np.zeros((ny, nx))
-            frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
-            for _, row in frame_df.iterrows():
-                spatial_mask[round(row['y']), round(row['x'])] = 1
-            convolved = convolve_fft(spatial_mask, kernel)
-            source_mask_2d[frame] = convolved >= 0.00001
-
-        # reshape source_mask_2d to 4D (n_int, n_groups, ny, nx) to match self.data
-        # any integration that contains a masked frame gets that group masked
-        source_mask_4d = source_mask_2d.reshape(self.n_int, self.n_group, ny, nx)
-
-        # mask detected source pixels in the raw data before building correction
-        masked_data = self.data.astype(float).copy()
-        masked_data[source_mask_4d] = np.nan
-
-        try:
-            mask = ~self.mask_tot if hasattr(self, 'mask_tot') else None
-            C_map = build_correction_map(masked_data, mask=mask)
-        except Exception as e:
-            print(f"Warning: second-pass correction map build failed ({e}). Reusing first-pass map.")
-            return
-
-        self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
-        print("Second-pass ramp correction map built with sources masked.")
-
-        filepath = os.path.join(self.obs_dir, "c_map_2.npy")
-        np.save(filepath, self.C_map_frames)
-
-
-    def _masked_reference(self, mask_radius=10):
-        """
-        Makes a reference frame (median) but masks out any variable sources.
-        Masks detected source positions and takes nanmedian of remaining pixels.
-        """
-        if self.filtered_sep_df.empty:
-            self.second_ref_frame = self.first_ref_frame.copy()
+        if self.filtered_sep_df.empty: # if no sources detected
+            C_map = build_correction_map(self.data)
+            self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
+            np.save(filepath, self.C_map_frames)
             return
 
         # source masks for each frame with detected variables
-        reference_cube = np.zeros_like(self.grad_cube)
+        source_cube = np.zeros_like(self.grad_cube)
         kernel = self._circle_app(mask_radius)
 
         for frame in self.frames:
@@ -824,22 +762,65 @@ class Jurassic():
                 for i in range(len(x_int)):
                     mask[y_int[i], x_int[i]] = 1
 
-                reference_cube[frame] = convolve_fft(mask, kernel)
+                source_cube[frame] = convolve_fft(mask, kernel)
 
-        source_mask = reference_cube >= 0.00001  # boolean: True = source pixel to exclude
+        filepath = os.path.join(self.obs_dir, "source_cube.npy")
+        np.save(filepath, source_cube)
+
+        source_mask = source_cube >= 0.00001  # boolean: True = source pixel to exclude
+
+        self.source_mask = source_mask # to be used for reference making as well
+        filepath = os.path.join(self.obs_dir, "source_mask.npy")
+        np.save(filepath, self.source_mask)
+
+        source_mask_4d = source_mask.reshape(self.n_int,self.n_group,self.data.shape[-2],self.data.shape[-1])
+
+        # mask detected source pixels in the raw data before building correction
+        masked_data = self.data.astype(float).copy()
+        masked_data[source_mask_4d] = np.nan
+
+        filepath = os.path.join(self.obs_dir, "masked_data.npy")
+        np.save(filepath, masked_data)
+
+        try:
+            C_map = build_correction_map(masked_data)
+        except Exception as e:
+            print(f"Warning: second-pass correction map build failed ({e}). Reusing first-pass map.")
+            C_map = build_correction_map(self.data)
+            self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
+            np.save(filepath, self.C_map_frames)
+            return
+        
+        self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
+        print("Second-pass ramp correction map built with sources masked.")
+        np.save(filepath, self.C_map_frames)
+
+
+    def _masked_reference(self,mask_correction):
+        """
+        Makes a reference frame (median) but masks out any variable sources.
+        Masks detected source positions and takes nanmedian of remaining pixels.
+        """
+        if self.filtered_sep_df.empty:
+            self.second_ref_frame = self.first_ref_frame.copy()
+            return
+        
+        if mask_correction == False:
+            self.second_ref_frame = self.first_ref_frame.copy()
+            return
 
         # Only use good frames (not bad/all-NaN)
         no_nans = np.nansum(self.grad_cube, axis=(1, 2)) > 0
         no_nans[self.bad_frames] = False
 
         good_slices = self.grad_cube.copy()[no_nans]
-        mask_slices = source_mask[no_nans]
+        mask_slices = self.source_mask[no_nans]
 
         # NaN out source pixels, then make reference from median
         masked_slices = np.where(mask_slices, np.nan, good_slices)
         self.second_ref_frame = np.nanmedian(masked_slices, axis=0)
 
-        filepath = os.path.join(self.obs_dir, "second_reference_frame.npy")
+        filepath = os.path.join(self.obs_dir, "ref_frame_2.npy")
         np.save(filepath, self.second_ref_frame)
 
 
@@ -1190,17 +1171,11 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg004_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg005_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg006_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg007_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg008_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/trappist-1/jw01177007001_03101_00001-seg010_mirimage_ramp.fits'
+files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00001_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00002_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00003_mirimage_ramp.fits',
+         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00004_mirimage_ramp.fits'
          ]
 
 for file in files:
-    Jurassic(file,method='mega',num_cores=55)
+    Jurassic(file,method='mega',num_cores=55)#,mask_correction=False)
