@@ -281,8 +281,8 @@ class Jurassic():
 
         other stuff I guess - will update at some point
         """
-
         self.file = file
+        self.name, self.obs_id = self.file.split('/')
         self.method = method
         self.mask_correction = mask_correction
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
@@ -318,11 +318,14 @@ class Jurassic():
                     self.source_extracting(self.diff_cube, save_plot=False, save_csv=True)
 
                     print('re-difference')
+<<<<<<< Updated upstream
                     self._masked_correction()
                     # put flux calibration in here
                     self._cube_gradient(self.mega_cube_masked, save=False)  # recompute from same mega_cube
                     if self.C_map_frames is not None:
                         self.grad_cube = self.grad_cube * self.C_map_frames
+=======
+>>>>>>> Stashed changes
                     self._masked_reference(self.mask_correction)
                     self._cube_differenced(self.grad_cube, self.second_ref_frame, save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -346,11 +349,14 @@ class Jurassic():
                     self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
                     print('re-difference')
+<<<<<<< Updated upstream
                     self._masked_correction()
                     # put flux calibration in here
                     if self.C_map_frames is not None:
                         self.rampy_cube = self.rampy_cube * self.C_map_frames
                         self._cube_gradient(self.rampy_cube,save=False)
+=======
+>>>>>>> Stashed changes
                     self._masked_reference(self.mask_correction) # creating new mask and doing differencing again
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -375,32 +381,72 @@ class Jurassic():
         """
         Opens the fits file and assigns the data to the class
         """
-        with fits.open(self.file) as hdul:
+        # base outputs folder (cwd)
+        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs')
+        os.makedirs(self.base_dir, exist_ok=True)
+
+        self.data_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic','pipeline_data/Obs')
+
+        # Remove the filename suffix
+        suffix1 = '_mirimage_ramp.fits'
+        suffix2 = '_mirimage_cal.fits'
+        if self.obs_id.endswith(suffix1):
+            obs_n = self.obs_id[:-len(suffix1)]
+        else:
+            obs_n = self.obs_id  # fallback
+
+        obs_name = f"cor_{obs_n}" 
+
+        # directory for specific observation/segment
+        self.obs_dir = os.path.join(self.base_dir, obs_name)
+        os.makedirs(self.obs_dir, exist_ok=True)
+
+        # get level 2a (ramp.fits) data
+        try:
+            self.stage1_dir = os.path.join(self.data_dir, 'stage1')
+            self.stage1_filepath = os.path.join(self.stage1_dir,self.file)
+        except:
+            print("Cannot find the Stage 1 file")
+
+        # get level 2b (cal.fits) data
+        try:
+            self.stage2_dir = os.path.join(self.data_dir, 'stage2')
+            # self.stage2_filepath = os.path.join(self.stage2_dir,self.obs_id)
+            self.stage2_filepath = os.path.join(self.stage2_dir,self.name,obs_n + suffix2)
+            self.do_flux_cal = True
+        except:
+            print("Cannot find the Stage 2 file --- No flux calibration will be performed")
+            self.do_flux_cal = False
+
+        # assigning data from ramp.fits file
+        with fits.open(self.stage1_filepath) as hdul:
             self.data = hdul[1].data # science data
             self.dq_2d_arr = hdul[2].data # data quality flag array for whole cube
             self.dq_3d_arr = hdul[3].data # data quality flag array for each group
             times = hdul[7].data
             self.time_df = pd.DataFrame(times)
+            self.filename = hdul[0].header['FILENAME']
             self.filter = hdul[0].header['FILTER']
             self.subarray = hdul[0].header['SUBARRAY']
-            self.filename = hdul[0].header['FILENAME']
             self.targname = hdul[0].header['TARGNAME']
 
-        # base outputs folder (cwd)
-        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs')
-        os.makedirs(self.base_dir, exist_ok=True)
-        # Remove the filename suffix
-        suffix = '_mirimage_ramp.fits'
-        if self.filename.endswith(suffix):
-            obs_name = self.filename[:-len(suffix)]
-        else:
-            obs_name = self.filename  # fallback
+        # assigning data from cal.fits file
+        if self.do_flux_cal:
+            with fits.open(self.stage2_filepath) as hdul:
+                self.cal_data = hdul[1].data
+            m, s = np.nanmedian(self.cal_data), np.nanstd(self.cal_data)
+            plt.figure()
+            plt.imshow(self.cal_data,origin='lower',vmin=m-s,vmax=m+s)
+            plt.savefig(os.path.join(self.obs_dir, 'cal_image.png'), bbox_inches="tight")
 
+<<<<<<< Updated upstream
         obs_name = f"c2m_{obs_name}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
         os.makedirs(self.obs_dir, exist_ok=True)
+=======
+>>>>>>> Stashed changes
 
         self.n_int = len(self.data) # number of integrations (ramps) in file
         self.n_group = len(self.data[0]) # number of groups per integration
@@ -419,6 +465,235 @@ class Jurassic():
             print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
 
 
+<<<<<<< Updated upstream
+=======
+    def correct_reset_decay(self, cube, method='median', mask=None, mask_dilation=0,
+                        edge_margin=10, dq=None, sat_bit=2,
+                        diagnostics=False, save_path=None):
+        """
+        Correct charge reset decay in MIRI ramp data.
+
+        tau is fitted globally from the spatial mean gradient profile and is the
+        same for all pixels. The last group-to-group gradient is always excluded
+        (last-frame anomaly).
+
+        Three methods:
+
+        'median' (default)
+            Fits C + A*exp(-g/tau) to the per-pixel median gradient profile.
+            A and C are per-pixel via linear regression with tau fixed.
+            A is constant across integrations.
+
+        'per_int'
+            Fits [C, A, delta] independently for each integration and each pixel
+            using linear regression with tau fixed. Removes residual offsets caused
+            by integration-to-integration variation in A (e.g. from charge-dependent
+            decay amplitude). Noisier than 'median' for individual pixels but
+            produces unbiased aperture-summed lightcurves.
+
+        'stretched_exp'
+            Fits per-pixel A from the median gradient profile (same first step),
+            then fits A(Q) = scale * exp(beta * Q^c) across pixels. For each ramp,
+            A is evaluated from the charge Q at the last good group, giving a
+            per-integration per-pixel amplitude while tau remains global.
+
+        Parameters
+        ----------
+        cube : ndarray (n_int, n_groups, ny, nx), float
+            Raw SCI data from uncal.fits.
+        method : {'median', 'per_int', 'stretched_exp'}
+        mask : ndarray (ny, nx) bool, optional
+            True = non-science pixel. Masked pixels are excluded from the tau
+            spatial mean fit and the A(Q) fit. Does not affect per-pixel A fitting
+            or the correction itself.
+        mask_dilation : int
+            Dilate the mask by this many pixels (circular) before applying to
+            fitting statistics. Excludes pixels near masked regions.
+        edge_margin : int
+            Border pixels excluded from the A(Q) fit in 'stretched_exp'.
+        dq : ndarray (n_int, n_groups, ny, nx) uint8, optional
+            GROUPDQ array. Used in 'stretched_exp' to find the last unsaturated
+            group per ramp for Q estimation.
+        sat_bit : int
+            GROUPDQ bit value for SATURATED (default 2).
+        diagnostics : bool
+            If True, produce diagnostic figures.
+        save_path : str or Path, optional
+            File path to save the diagnostic figure. Only used when diagnostics=True.
+
+        Returns
+        -------
+        cube_cor : ndarray (n_int, n_groups, ny, nx)
+            Corrected SCI cube. Groups 1 through n_groups-2 have the cumulative
+            decay subtracted; group 0 is corrected for the first-frame offset.
+        """
+        cube = np.asarray(cube, dtype=float)
+        self.n_int, self.n_groups, ny, nx = cube.shape
+        n_grads = self.n_groups - 2  # drop last gradient (last-frame anomaly)
+
+        grads = np.diff(cube, axis=1)[:, :n_grads]        # (n_int, n_grads, ny, nx)
+        med_grad = np.median(grads, axis=0)                # (n_grads, ny, nx)
+        g_arr = np.arange(n_grads, dtype=float)
+
+        if mask is not None and mask_dilation > 0:
+            from scipy.ndimage import binary_dilation
+            r = mask_dilation
+            yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+            struct = (yy**2 + xx**2) <= r**2
+            mask = binary_dilation(mask, structure=struct)
+        sci = ~mask if mask is not None else np.ones((ny, nx), dtype=bool)
+
+        # Global tau from spatial mean over science pixels, excluding gradient 0.
+        # Gradient 0 is suppressed by the first-frame anomaly (group 0 has extra
+        # reset charge), which breaks the monotonic-decay assumption at g=0.
+        mean_profile = np.nanmean(med_grad[:, sci], axis=1)
+        mean_profile_fit = mean_profile[1:]
+        def _exp_model(g, C, A, t):
+            return C + A * np.exp(-g / t)
+        popt, _ = curve_fit(_exp_model, g_arr[1:], mean_profile_fit,
+                            p0=[mean_profile_fit[-1],
+                                mean_profile_fit[0] - mean_profile_fit[-1],
+                                1.5])
+        tau = float(popt[2])
+
+        # Per-pixel fit: [C, A, delta] where delta is the first-frame offset.
+        # The design matrix has a -1 in the delta column only for g=0, accounting
+        # for the suppression of gradient 0 by the first-frame anomaly.
+        exp_g = np.exp(-g_arr / tau)                       # (n_grads,)
+        ff_col = np.zeros(n_grads); ff_col[0] = -1.0
+        X = np.column_stack([np.ones(n_grads), exp_g, ff_col])  # (n_grads, 3)
+        params, _, _, _ = np.linalg.lstsq(
+            X, med_grad.reshape(n_grads, -1), rcond=None)
+        A_map = params[1].reshape(ny, nx)                  # (ny, nx)
+        delta_map = params[2].reshape(ny, nx)              # first-frame offset (ny, nx)
+
+        if method == 'median':
+            print('median method started')
+            decay_cumsum = np.cumsum(A_map * exp_g[:, None, None], axis=0)  # (n_grads, ny, nx)
+            cube_cor = cube.copy()
+            cube_cor[:, 1:n_grads + 1] -= decay_cumsum[None]
+            cube_cor[:, 0] -= delta_map[None]
+            print('median method done')
+            print(f'cube_cor created, shape: {cube_cor.shape}')
+
+        elif method == 'per_int':
+            # Fit [C_i, A_i, delta_i] independently per integration per pixel.
+            # tau is still global. This removes residual offsets from integration-
+            # to-integration variation in A (charge-dependent decay amplitude).
+            grads_flat = grads.reshape(self.n_int, n_grads, -1)    # (n_int, n_grads, ny*nx)
+            A_int = np.empty((self.n_int, ny * nx))
+            delta_int = np.empty((self.n_int, ny * nx))
+            for i in range(self.n_int):
+                p, _, _, _ = np.linalg.lstsq(X, grads_flat[i], rcond=None)
+                A_int[i] = p[1]
+                delta_int[i] = p[2]
+            A_int = A_int.reshape(self.n_int, ny, nx)
+            delta_int = delta_int.reshape(self.n_int, ny, nx)
+
+            decay_cumsum = np.cumsum(
+                A_int[:, None, :, :] * exp_g[None, :, None, None], axis=1)
+            cube_cor = cube.copy()
+            cube_cor[:, 1:n_grads + 1] -= decay_cumsum
+            cube_cor[:, 0] -= delta_int
+
+        else:
+            # --- method == 'stretched_exp' ---
+            edge_mask = np.zeros((ny, nx), dtype=bool)
+            edge_mask[:edge_margin] = True
+            edge_mask[-edge_margin:] = True
+            edge_mask[:, :edge_margin] = True
+            edge_mask[:, -edge_margin:] = True
+
+            Q_med = np.median(cube[:, n_grads, :, :], axis=0)  # (ny, nx)
+            fit_mask = ~edge_mask & sci & np.isfinite(A_map) & (Q_med > 0)
+
+            def _stretched(Q, scale, beta, c):
+                return scale * np.exp(beta * Q**c)
+            Q_fit, A_fit = Q_med[fit_mask], A_map[fit_mask]
+            popt_s, _ = curve_fit(_stretched, Q_fit, A_fit,
+                                p0=[np.percentile(A_fit, 10), 1e-3, 0.6],
+                                maxfev=50000)
+            scale, beta, c = popt_s
+
+            # Per-ramp Q from last unsaturated group
+            if dq is not None:
+                bad = (dq[:, :n_grads + 1] & sat_bit) > 0
+                not_bad_rev = ~bad[:, ::-1]
+                last_rev = np.argmax(not_bad_rev, axis=1)
+                last_good = np.clip(n_grads - last_rev, 0, n_grads)
+                ii = np.arange(self.n_int)[:, None, None]
+                yy = np.arange(ny)[None, :, None]
+                xx = np.arange(nx)[None, None, :]
+                Q_int = cube[ii, last_good, yy, xx]        # (n_int, ny, nx)
+            else:
+                Q_int = cube[:, n_grads, :, :]
+
+            Q_int = np.clip(Q_int, 1.0, None)
+            A_int = scale * np.exp(beta * Q_int**c)        # (n_int, ny, nx)
+
+            decay_cumsum = np.cumsum(
+                A_int[:, None, :, :] * exp_g[None, :, None, None], axis=1)
+            cube_cor = cube.copy()
+            cube_cor[:, 1:n_grads + 1] -= decay_cumsum
+            cube_cor[:, 0] -= delta_map[None]
+
+        if diagnostics:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            n_panels = 3 if method == 'stretched_exp' else 2
+            fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4))
+
+            ax = axes[0]
+            g_fine = np.linspace(1, n_grads - 1, 200)
+            C_fit, A_fit_mean = float(popt[0]), float(popt[1])
+            ax.plot(g_arr[0], mean_profile[0], 'o', color='gray', ms=5, label='g=0 (excluded from fit)')
+            ax.plot(g_arr[1:], mean_profile[1:], 'o', color='k', ms=5, label='Spatial mean')
+            ax.plot(g_fine, C_fit + A_fit_mean * np.exp(-g_fine / tau),
+                    '--', color='C3', lw=1.5, label=f'Fit  τ={tau:.2f} grp')
+            ax.set_xlabel('Gradient index')
+            ax.set_ylabel('Mean gradient (DN/group)')
+            ax.set_title('Global τ fit')
+            ax.legend(fontsize=8)
+            ax.set_xticks(g_arr.astype(int))
+
+            ax = axes[1]
+            vmax = np.nanpercentile(A_map, 99)
+            im = ax.imshow(A_map, origin='lower', vmin=0, vmax=vmax, cmap='viridis')
+            fig.colorbar(im, ax=ax, label='DN/group')
+            ax.set_title('Decay amplitude A')
+            ax.set_xlabel('x')
+            ax.set_ylabel('y')
+
+            if method == 'stretched_exp':
+                ax = axes[2]
+                ax.scatter(Q_med[fit_mask], A_map[fit_mask], s=1, alpha=0.1,
+                        color='C0', rasterized=True)
+                q_line = np.linspace(np.nanpercentile(Q_med[fit_mask], 1),
+                                    np.nanpercentile(Q_med[fit_mask], 99), 300)
+                ax.plot(q_line, scale * np.exp(beta * q_line**c), '-', color='C3',
+                        lw=1.5, label=f'scale={scale:.2f}, β={beta:.3e}, c={c:.3f}')
+                ax.set_xlabel('Q at last group (DN)')
+                ax.set_ylabel('A (DN/group)')
+                ax.set_title('A(Q) stretched exponential fit')
+                ax.legend(fontsize=8)
+
+            fig.suptitle(f'Reset decay correction diagnostics  (method={method})',
+                        fontsize=11, fontweight='bold')
+            fig.tight_layout()
+
+            if save_path is not None:
+                fig.savefig(Path(save_path), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        
+        self.data_cor = cube_cor
+        print('cube_cor assigned')
+        # return cube_cor
+
+
+>>>>>>> Stashed changes
     def _make_cubes(self):
         """
         makes cube from 4d uncal file, also jump detected cube
@@ -734,7 +1009,11 @@ class Jurassic():
             self.total_df.to_csv(filepath, index=False)
 
 
+<<<<<<< Updated upstream
     def _masked_correction(self, mask_radius=10):
+=======
+    def _masked_reference(self,mask_correction,mask_radius=10):
+>>>>>>> Stashed changes
         """
         Rebuilds the correction map from self.data (4d ramps) but with detected variable
         sources masked out so variable source flux doesn't bias the correction.
@@ -1171,6 +1450,7 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
+<<<<<<< Updated upstream
 files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00001_mirimage_ramp.fits',
          '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00002_mirimage_ramp.fits',
          '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00003_mirimage_ramp.fits',
@@ -1179,3 +1459,10 @@ files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/s
 
 for file in files:
     Jurassic(file,method='mega',num_cores=55)#,mask_correction=False)
+=======
+files = ['ast6/jw02304001001_03101_00001-seg001_mirimage_ramp.fits'
+         ]
+
+for file in files:
+    Jurassic(file,method='mega',num_cores=35)#,mask_correction=False)
+>>>>>>> Stashed changes
