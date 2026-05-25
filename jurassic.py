@@ -9,6 +9,8 @@ import sep
 from astropy.io import fits     
 from astropy.convolution import convolve_fft
 from joblib import Parallel, delayed
+from pathlib import Path
+from scipy.optimize import curve_fit
 from astropy.stats import sigma_clipped_stats, sigma_clip
 from lacosmic.core import lacosmic # func is apparently deprecated - will be 'remove_cosmics'
 from skimage.restoration import inpaint
@@ -55,100 +57,6 @@ def linear_fitting(coords,cube,n_int,n_group):
         resids.append(r[0] if len(r) > 0 else np.nan)
         
     return [row, col, grads, intercepts, resids]
-
-# ------- new stuff for ramp correction -----
-
-def build_correction_map(cube, mask=None):
-    """
-    Derive the per-pixel group correction map from a ramp cube.
-    C_map[-2] = 1 everywhere (second-to-last group is the reference).
-    C_map[-1] = NaN everywhere (last gradient is reset-contaminated).
-
-    Parameters
-    ----------
-    cube : ndarray, shape (n_int, n_groups, ny, nx)
-        Raw 4D ramp cube (before reshaping to frame-indexed format).
-    mask : ndarray, shape (ny, nx), bool, optional
-        True = bad pixels to interpolate over.
-
-    Returns
-    -------
-    C_map : ndarray, shape (n_groups-1, ny, nx)
-    """
-    from scipy.interpolate import griddata
-
-    grads = np.diff(cube, axis=1).astype(float)
-    med_grad = np.nanmedian(grads, axis=0)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        C_map = np.where(med_grad != 0, med_grad[-2:-1] / med_grad, np.nan)
-
-    # last gradient is reset-contaminated, cannot correct that
-    C_map[-1] = np.nan
-
-    if mask is not None:
-        ny, nx = mask.shape
-        yy, xx = np.mgrid[0:ny, 0:nx]
-
-        valid_for_good = np.ones(C_map.shape[0], dtype=bool)
-        valid_for_good[-1] = False
-
-        good = ~mask & np.isfinite(C_map[0])
-        good_yx = np.column_stack([yy[good], xx[good]])
-
-        for g in range(C_map.shape[0]):
-            if not valid_for_good[g]:
-                continue
-            needs_fill = mask | ~np.isfinite(C_map[g])
-            if not needs_fill.any():
-                continue
-            fill_yx = np.column_stack([yy[needs_fill], xx[needs_fill]])
-            good_vals = C_map[g][good]
-            filled = griddata(good_yx, good_vals, fill_yx, method='linear')
-            still_nan = ~np.isfinite(filled)
-            if still_nan.any():
-                filled[still_nan] = griddata(
-                    good_yx, good_vals, fill_yx[still_nan], method='nearest'
-                )
-            C_map[g][needs_fill] = filled
-
-    return C_map
-
-
-def reshape_correction_map(C_map, n_int, n_groups):
-    """
-    Reshape C_map from (n_groups-1, ny, nx) to (n_frames, ny, nx)
-    to match JURASSIC's frame-indexed rampy_cube format.
-    Bad frames (first and last of each integration) are set to NaN.
-
-    Parameters
-    ----------
-    C_map : ndarray, shape (n_groups-1, ny, nx)
-    n_int : int
-    n_groups : int
-
-    Returns
-    -------
-    C_map_frames : ndarray, shape (n_frames, ny, nx)
-    """
-    ny, nx = C_map.shape[1], C_map.shape[2]
-
-    # pad with NaN at position 0 to align gradient index g with frame index g
-    C_map_padded = np.concatenate([np.full((1, ny, nx), np.nan), C_map], axis=0)
-
-    # tile across integrations
-    C_map_frames = np.tile(C_map_padded, (n_int, 1, 1))
-
-    # NaN out bad frames
-    for integration in range(n_int):
-        first = integration * n_groups
-        last  = (integration + 1) * n_groups - 1
-        C_map_frames[first] = np.nan
-        C_map_frames[last]  = np.nan
-
-    return C_map_frames
-
-# -------------------------------
 
 
 def run_lacosmic(frame_data, mask):
@@ -300,6 +208,7 @@ class Jurassic():
         
         if run:
             self._assign_data()
+            self.correct_reset_decay(cube=self.data)
             self._make_cubes()
             self._mask_pixels()
 
@@ -318,14 +227,6 @@ class Jurassic():
                     self.source_extracting(self.diff_cube, save_plot=False, save_csv=True)
 
                     print('re-difference')
-<<<<<<< Updated upstream
-                    self._masked_correction()
-                    # put flux calibration in here
-                    self._cube_gradient(self.mega_cube_masked, save=False)  # recompute from same mega_cube
-                    if self.C_map_frames is not None:
-                        self.grad_cube = self.grad_cube * self.C_map_frames
-=======
->>>>>>> Stashed changes
                     self._masked_reference(self.mask_correction)
                     self._cube_differenced(self.grad_cube, self.second_ref_frame, save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -349,14 +250,6 @@ class Jurassic():
                     self.source_extracting(self.diff_cube,save_plot=False,save_csv=False)
 
                     print('re-difference')
-<<<<<<< Updated upstream
-                    self._masked_correction()
-                    # put flux calibration in here
-                    if self.C_map_frames is not None:
-                        self.rampy_cube = self.rampy_cube * self.C_map_frames
-                        self._cube_gradient(self.rampy_cube,save=False)
-=======
->>>>>>> Stashed changes
                     self._masked_reference(self.mask_correction) # creating new mask and doing differencing again
                     self._cube_differenced(self.grad_cube,self.second_ref_frame,save=True)
                     self._remove_cosmic(self.diff_cube)
@@ -439,14 +332,6 @@ class Jurassic():
             plt.imshow(self.cal_data,origin='lower',vmin=m-s,vmax=m+s)
             plt.savefig(os.path.join(self.obs_dir, 'cal_image.png'), bbox_inches="tight")
 
-<<<<<<< Updated upstream
-        obs_name = f"c2m_{obs_name}" 
-
-        # directory for specific observation/segment
-        self.obs_dir = os.path.join(self.base_dir, obs_name)
-        os.makedirs(self.obs_dir, exist_ok=True)
-=======
->>>>>>> Stashed changes
 
         self.n_int = len(self.data) # number of integrations (ramps) in file
         self.n_group = len(self.data[0]) # number of groups per integration
@@ -465,8 +350,6 @@ class Jurassic():
             print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
 
 
-<<<<<<< Updated upstream
-=======
     def correct_reset_decay(self, cube, method='median', mask=None, mask_dilation=0,
                         edge_margin=10, dq=None, sat_bit=2,
                         diagnostics=False, save_path=None):
@@ -693,13 +576,12 @@ class Jurassic():
         # return cube_cor
 
 
->>>>>>> Stashed changes
     def _make_cubes(self):
         """
         makes cube from 4d uncal file, also jump detected cube
         """
         # make the rampy science data cube
-        ramps = np.array_split(self.data,self.n_int,axis=0)
+        ramps = np.array_split(self.data_cor,self.n_int,axis=0)
         rampy_cube = np.concatenate(ramps,axis=1)
         self.rampy_cube = np.squeeze(rampy_cube)
 
@@ -1009,25 +891,21 @@ class Jurassic():
             self.total_df.to_csv(filepath, index=False)
 
 
-<<<<<<< Updated upstream
-    def _masked_correction(self, mask_radius=10):
-=======
     def _masked_reference(self,mask_correction,mask_radius=10):
->>>>>>> Stashed changes
         """
-        Rebuilds the correction map from self.data (4d ramps) but with detected variable
-        sources masked out so variable source flux doesn't bias the correction.
+        Makes a reference frame (median) but masks out any variable sources.
+        Masks detected source positions and takes nanmedian of remaining pixels.
         """
-        filepath = os.path.join(self.obs_dir, "c_map.npy")
+        if self.filtered_sep_df.empty:
+            self.second_ref_frame = self.first_ref_frame.copy()
+            return
 
-        if self.filtered_sep_df.empty: # if no sources detected
-            C_map = build_correction_map(self.data)
-            self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
-            np.save(filepath, self.C_map_frames)
+        if mask_correction == False:
+            self.second_ref_frame = self.first_ref_frame.copy()
             return
 
         # source masks for each frame with detected variables
-        source_cube = np.zeros_like(self.grad_cube)
+        reference_cube = np.zeros_like(self.grad_cube)
         kernel = self._circle_app(mask_radius)
 
         for frame in self.frames:
@@ -1041,52 +919,10 @@ class Jurassic():
                 for i in range(len(x_int)):
                     mask[y_int[i], x_int[i]] = 1
 
-                source_cube[frame] = convolve_fft(mask, kernel)
+                reference_cube[frame] = convolve_fft(mask, kernel)
 
-        filepath = os.path.join(self.obs_dir, "source_cube.npy")
-        np.save(filepath, source_cube)
-
-        source_mask = source_cube >= 0.00001  # boolean: True = source pixel to exclude
-
-        self.source_mask = source_mask # to be used for reference making as well
-        filepath = os.path.join(self.obs_dir, "source_mask.npy")
-        np.save(filepath, self.source_mask)
-
-        source_mask_4d = source_mask.reshape(self.n_int,self.n_group,self.data.shape[-2],self.data.shape[-1])
-
-        # mask detected source pixels in the raw data before building correction
-        masked_data = self.data.astype(float).copy()
-        masked_data[source_mask_4d] = np.nan
-
-        filepath = os.path.join(self.obs_dir, "masked_data.npy")
-        np.save(filepath, masked_data)
-
-        try:
-            C_map = build_correction_map(masked_data)
-        except Exception as e:
-            print(f"Warning: second-pass correction map build failed ({e}). Reusing first-pass map.")
-            C_map = build_correction_map(self.data)
-            self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
-            np.save(filepath, self.C_map_frames)
-            return
-        
-        self.C_map_frames = reshape_correction_map(C_map, self.n_int, self.n_group)
-        print("Second-pass ramp correction map built with sources masked.")
-        np.save(filepath, self.C_map_frames)
-
-
-    def _masked_reference(self,mask_correction):
-        """
-        Makes a reference frame (median) but masks out any variable sources.
-        Masks detected source positions and takes nanmedian of remaining pixels.
-        """
-        if self.filtered_sep_df.empty:
-            self.second_ref_frame = self.first_ref_frame.copy()
-            return
-        
-        if mask_correction == False:
-            self.second_ref_frame = self.first_ref_frame.copy()
-            return
+        source_mask = reference_cube >= 0.00001  # boolean: True = source pixel to exclude
+        self.source_mask = source_mask
 
         # Only use good frames (not bad/all-NaN)
         no_nans = np.nansum(self.grad_cube, axis=(1, 2)) > 0
@@ -1314,13 +1150,13 @@ class Jurassic():
 
             if  dist > threshold_1:
                 num_candidates_1+=1
-                ids.append((f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
             if dist < threshold_1 and dist > threshold_2:
                 num_candidates_2+=1
-                ids.append((f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
             if dist < threshold_2 and dist > threshold_3:
                 num_candidates_3+=1
-                ids.append((f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]},{row_min["y"]})'))
+                ids.append((f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
 
         return num_candidates_1+num_candidates_2+num_candidates_3, ids
     
@@ -1450,19 +1286,8 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-<<<<<<< Updated upstream
-files = ['/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00001_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00002_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00003_mirimage_ramp.fits',
-         '/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/stuff/jw06122010001_02101_00004_mirimage_ramp.fits'
-         ]
-
-for file in files:
-    Jurassic(file,method='mega',num_cores=55)#,mask_correction=False)
-=======
 files = ['ast6/jw02304001001_03101_00001-seg001_mirimage_ramp.fits'
          ]
 
 for file in files:
     Jurassic(file,method='mega',num_cores=35)#,mask_correction=False)
->>>>>>> Stashed changes
