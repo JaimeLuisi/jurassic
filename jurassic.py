@@ -189,7 +189,9 @@ class Jurassic():
         other stuff I guess - will update at some point
         """
         self.file = file
-        self.name, self.obs_id = self.file.split('/')
+        parts = self.file.replace('\\', '/').split('/')
+        self.name = parts[-2] if len(parts) >= 2 else '.'
+        self.obs_id = parts[-1]
         self.method = method
         self.plot = plot
         self.base_dir = base_dir
@@ -310,7 +312,7 @@ class Jurassic():
             self.do_flux_cal = os.path.exists(self.stage2_filepath)
             if not self.do_flux_cal:
                 print("Cannot find the Stage 2 file --- No flux calibration will be performed")
-        except:
+        except OSError:
             print("Cannot find the Stage 2 file --- No flux calibration will be performed")
             self.do_flux_cal = False
 
@@ -347,10 +349,10 @@ class Jurassic():
             bad_frames.append(((integration+1)*self.n_group)-1)
         self.bad_frames = bad_frames
 
-        try:
+        if self.filter in self.psf_fwhm_px:
             self.fwhm = self.psf_fwhm_px[self.filter]
-        except:
-            print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
+        else:
+            raise ValueError(f'Unknown filter {self.filter}: no FWHM available')
 
 
     def correct_reset_decay(self, cube, method='median', mask=None, mask_dilation=0,
@@ -1104,8 +1106,7 @@ class Jurassic():
 
         output = pd.DataFrame()
 
-        ids = df['objid'].tolist()
-        ids_list = list(range(1,ids[-1]+1))
+        ids_list = sorted(df['objid'].unique())
 
         for id in ids_list:
             obj_df = df[df['objid']==id]
