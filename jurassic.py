@@ -13,7 +13,6 @@ from pathlib import Path
 from scipy.optimize import curve_fit
 from astropy.stats import sigma_clipped_stats, sigma_clip
 from lacosmic.core import lacosmic # func is apparently deprecated - will be 'remove_cosmics'
-from skimage.restoration import inpaint
 from sklearn.cluster import DBSCAN
 
 import warnings
@@ -174,7 +173,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True,plot=True):
         """
         Initialise or whatevs
 
@@ -192,6 +191,7 @@ class Jurassic():
         self.file = file
         self.name, self.obs_id = self.file.split('/')
         self.method = method
+        self.plot = plot
         self.mask_correction = mask_correction
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
@@ -1189,7 +1189,198 @@ class Jurassic():
         df = df.merge(self.frame_mjd_df, on="frame", how="left")
 
         return df
-    
+
+
+    def plot_detection(self, save_dir, latex=True, lc_units='dn/s'):
+        """
+        Tessellate-identical 3-panel figure for each detected event:
+          left   — light curve with event span highlighted and zoom inset
+          middle — 19x19 px cutout at the brightest frame ('Brightest image')
+          right  — same cutout 1 hour later
+        Saves as object{objid:04d}_event{eventid}of{total_events}.png
+        """
+        import matplotlib.patches as patches
+        from matplotlib.lines import Line2D
+        from mpl_toolkits.axes_grid1.inset_locator import mark_inset
+
+        if latex:
+            plt.rc('text', usetex=True)
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        mjd_arr = self.frame_mjd_df.set_index('frame')['mjd'].values
+        time = mjd_arr - mjd_arr[0]
+        cadence = np.median(np.diff(time))
+        group_time_s = cadence * 86400  # MJD days → seconds, for DN/s scaling
+
+        # Detect gaps in the time series
+        med = np.nanmedian(np.diff(time))
+        std = np.nanstd(np.diff(time))
+        break_ind = np.where(np.diff(time) > med + 1 * std)[0]
+        break_ind = np.append(break_ind, len(time))
+        break_ind += 1
+        break_ind = np.insert(break_ind, 0, 0)
+
+        obj_ids = sorted([oid for oid in self.events['objid'].unique() if oid > 0])
+
+        for objid in obj_ids:
+            obj_df = self.events[self.events['objid'] == objid].sort_values('frame')
+            if obj_df.empty:
+                continue
+
+            # Build per-object event list from DBSCAN 'event' column
+            if 'event' in obj_df.columns and obj_df['event'].notna().any():
+                event_labels = sorted(obj_df['event'].dropna().unique())
+            else:
+                event_labels = [None]
+            total_events = len(event_labels)
+
+            for eventid, event_label in enumerate(event_labels, start=1):
+                ev_df = obj_df if event_label is None else obj_df[obj_df['event'] == event_label]
+                if ev_df.empty:
+                    continue
+
+                x = int(round(ev_df['x'].mean()))
+                y = int(round(ev_df['y'].mean()))
+                frame_start = int(ev_df['frame'].min())
+                frame_end = int(ev_df['frame'].max())
+
+                # Aperture LC using filter FWHM as radius (buffer = floor(fwhm))
+                buf = int(np.floor(self.fwhm))
+                f = np.nansum(self.clean_cube[:,
+                                              max(0, y - buf):min(self.clean_cube.shape[1], y + buf + 1),
+                                              max(0, x - buf):min(self.clean_cube.shape[2], x + buf + 1)],
+                              axis=(1, 2))
+                if lc_units == 'dn/s':
+                    f = f / group_time_s
+
+                # Brightest frame within detection span
+                if frame_end - frame_start >= 2:
+                    brightestframe = frame_start + int(np.where(
+                        np.abs(f[frame_start:frame_end]) == np.nanmax(np.abs(f[frame_start:frame_end]))
+                    )[0][0])
+                else:
+                    brightestframe = frame_start
+                try:
+                    brightestframe = int(brightestframe)
+                except TypeError:
+                    brightestframe = int(brightestframe[0])
+                if brightestframe >= self.clean_cube.shape[0]:
+                    brightestframe -= 1
+                if frame_end >= self.clean_cube.shape[0]:
+                    frame_end -= 1
+
+                fstart = frame_start - 20
+                if fstart < 0:
+                    fstart = 0
+                zoom = f[fstart:frame_end + 20]
+
+                fig, ax = plt.subplot_mosaic([[1, 1, 1, 2, 2], [1, 1, 1, 3, 3]],
+                                             figsize=(7 * 1.1, 5.5 * 1.1), constrained_layout=True)
+
+                # Ghost plot to fix inset ylims
+                ax[1].plot(time[fstart:frame_end + 20], zoom, 'k', alpha=0)
+                insert_ylims = ax[1].get_ylim()
+
+                # Full light curve per segment
+                for seg in range(len(break_ind) - 1):
+                    ax[1].plot(time[break_ind[seg]:break_ind[seg + 1]],
+                               f[break_ind[seg]:break_ind[seg + 1]], 'k', alpha=0.8)
+
+                ylims = ax[1].get_ylim()
+                ax[1].set_ylim(ylims[0], ylims[1] + abs(ylims[0] - ylims[1]))
+                ax[1].set_xlim(np.min(time), np.max(time))
+                ax[1].set_title(f'{self.filename}   |   ObjID: {objid}', fontsize=15)
+                ax[1].set_ylabel('DN/s' if lc_units == 'dn/s' else 'DN/group', fontsize=15, labelpad=10)
+                ax[1].set_xlabel(f'Time (MJD - {np.round(mjd_arr[0], 3)})', fontsize=15)
+
+                axins = ax[1].inset_axes([0.1, 0.55, 0.86, 0.43])
+                axins.axvspan(time[frame_start] - cadence / 2,
+                              time[frame_end] + cadence / 2, color='C1', alpha=0.4)
+                for seg in range(len(break_ind) - 1):
+                    axins.plot(time[break_ind[seg]:break_ind[seg + 1]],
+                               f[break_ind[seg]:break_ind[seg + 1]], 'k', alpha=0.8, marker='.')
+
+                duration = frame_end - frame_start
+                if duration < 4:
+                    duration = 4
+                fe = frame_end + 20
+                if fe >= len(time):
+                    fe = len(time) - 1
+                xmin_z = time[frame_start] - (3 * duration * cadence)
+                xmax_z = time[frame_end] + (3 * duration * cadence)
+                if xmin_z <= 0:
+                    xmin_z = 0
+                if xmax_z >= np.nanmax(time):
+                    xmax_z = np.nanmax(time)
+                axins.set_xlim(xmin_z, xmax_z)
+                axins.set_ylim(insert_ylims[0], insert_ylims[1])
+                mark_inset(ax[1], axins, loc1=3, loc2=4, fc="none", ec="r", lw=2)
+                plt.setp(axins.spines.values(), color='r', lw=2)
+                plt.setp([axins.get_xticklines(), axins.get_yticklines()], color='C3')
+
+                # Colour stretch from 3x3 patch at brightest frame
+                bright_frame = self.clean_cube[brightestframe, max(0, y - 1):y + 2, max(0, x - 1):x + 2]
+                vmin = np.percentile(self.clean_cube[brightestframe], 16)
+                try:
+                    vmax = np.percentile(bright_frame, 80)
+                except Exception:
+                    vmax = vmin + 20
+                if vmin >= vmax:
+                    vmin = vmax - 5
+
+                # 19x19 px cutout
+                ymin = y - 9
+                if ymin < 0:
+                    ymin = 0
+                xmin = x - 9
+                if xmin < 0:
+                    xmin = 0
+                cutout_image = self.clean_cube[:, ymin:y + 10, xmin:x + 10]
+
+                ax[2].imshow(cutout_image[brightestframe], cmap='gray', origin='lower',
+                             vmin=vmin, vmax=vmax)
+                ax[2].scatter(ev_df['x'].mean() - xmin, ev_df['y'].mean() - ymin,
+                              color='r', s=50, marker='x', lw=2)
+                ax[2].set_title('Brightest frame', fontsize=15)
+                ax[2].get_xaxis().set_visible(False)
+                ax[2].get_yaxis().set_visible(False)
+                ax[3].get_xaxis().set_visible(False)
+                ax[3].get_yaxis().set_visible(False)
+
+                # 20 frames later (or last available frame)
+                after = min(brightestframe + 20, len(cutout_image) - 1)
+
+                ax[3].imshow(cutout_image[after], cmap='gray', origin='lower',
+                             vmin=vmin, vmax=vmax)
+                ax[3].set_title(f'Frame +{after - brightestframe}', fontsize=15)
+                ax[3].annotate('', xy=(0.2, 1.15), xycoords='axes fraction', xytext=(0.2, 1.),
+                               arrowprops=dict(arrowstyle="<|-", color='r', lw=3))
+                ax[3].annotate('', xy=(0.8, 1.15), xycoords='axes fraction', xytext=(0.8, 1.),
+                               arrowprops=dict(arrowstyle="<|-", color='r', lw=3))
+
+                # 5x5 red/cyan detection box — separate patches per panel (matching tessellate)
+                rect = patches.Rectangle((x - 2.5 - xmin, y - 2.5 - ymin), 5, 5,
+                                         linewidth=3, edgecolor='r', facecolor='none')
+                ax[2].add_patch(rect)
+                ax[2].add_line(Line2D([x - 2.5 - xmin, x + 2.5 - xmin],
+                                      [y + 2.5 - ymin, y + 2.5 - ymin], color='c', linewidth=3))
+                ax[2].add_line(Line2D([x + 2.5 - xmin, x + 2.5 - xmin],
+                                      [y - 2.5 - ymin, y + 2.5 - ymin], color='c', linewidth=3))
+
+                rect = patches.Rectangle((x - 2.5 - xmin, y - 2.5 - ymin), 5, 5,
+                                         linewidth=3, edgecolor='r', facecolor='none')
+                ax[3].add_patch(rect)
+                ax[3].add_line(Line2D([x - 2.5 - xmin, x + 2.5 - xmin],
+                                      [y + 2.5 - ymin, y + 2.5 - ymin], color='c', linewidth=3))
+                ax[3].add_line(Line2D([x + 2.5 - xmin, x + 2.5 - xmin],
+                                      [y - 2.5 - ymin, y + 2.5 - ymin], color='c', linewidth=3))
+
+                plt.savefig(os.path.join(save_dir,
+                                         f'object{objid:04d}_event{eventid}of{total_events}.png'),
+                            bbox_inches='tight')
+                plt.close(fig)
+
 
     def save_outputs(self):
         """
@@ -1223,16 +1414,20 @@ class Jurassic():
             g_sig_df = self.assign_mjd(g_sig_df)
             filepath = os.path.join(self.grouped_dir, 'grouped_significance.csv')
             g_sig_df.to_csv(filepath,index=False)
+            if self.plot:
+                self.plot_detection(os.path.join(self.grouped_dir, 'detection_figures_sig'))
 
         # filtered sep sources (grouped)
         num_candidates, data = 0, []
         if len(self.filtered_sep_df) > 0:
-            g_filt_sep_df = self._spatial_group(self.filtered_sep_df)
-            g_filt_sep_df = g_filt_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
-            g_filt_sep_df = self._temporal_group(g_filt_sep_df)
-            g_filt_sep_df = self.assign_mjd(g_filt_sep_df)
-            g_filt_sep_df.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
-            num_candidates, data = self.asteroid_candidate(g_filt_sep_df)
+            self.events = self._spatial_group(self.filtered_sep_df)
+            self.events = self.events.sort_values(by=['objid', 'frame'], ascending=[True, True])
+            self.events = self._temporal_group(self.events)
+            self.events = self.assign_mjd(self.events)
+            self.events.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
+            if self.plot:
+                self.plot_detection(os.path.join(self.grouped_dir, 'detection_figures_sep'))
+            num_candidates, data = self.asteroid_candidate(self.events)
 
         
         g_tot_sep_df = self._spatial_group(self.total_df)
@@ -1286,8 +1481,8 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-files = ['ast6/jw02304001001_03101_00001-seg001_mirimage_ramp.fits'
-         ]
+if __name__ == '__main__':
+    files = ['ast6/jw02304001001_03101_00001-seg001_mirimage_ramp.fits']
 
-for file in files:
-    Jurassic(file,method='mega',num_cores=35)#,mask_correction=False)
+    for file in files:
+        Jurassic(file, method='mega', num_cores=35)
