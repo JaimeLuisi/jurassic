@@ -173,7 +173,7 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True,plot=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True,plot=True,base_dir=None,data_dir=None):
         """
         Initialise or whatevs
 
@@ -192,6 +192,8 @@ class Jurassic():
         self.name, self.obs_id = self.file.split('/')
         self.method = method
         self.plot = plot
+        self.base_dir = base_dir
+        self.data_dir = data_dir
         self.mask_correction = mask_correction
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
@@ -274,11 +276,14 @@ class Jurassic():
         """
         Opens the fits file and assigns the data to the class
         """
-        # base outputs folder (cwd)
-        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs')
+        # base outputs folder — defaults to outputs/ relative to cwd
+        if self.base_dir is None:
+            self.base_dir = os.path.join(os.getcwd(), 'outputs')
         os.makedirs(self.base_dir, exist_ok=True)
 
-        self.data_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic','pipeline_data/Obs')
+        # data folder — defaults to the directory containing the ramp file
+        if self.data_dir is None:
+            self.data_dir = os.path.dirname(os.path.abspath(self.file))
 
         # Remove the filename suffix
         suffix1 = '_mirimage_ramp.fits'
@@ -295,18 +300,16 @@ class Jurassic():
         os.makedirs(self.obs_dir, exist_ok=True)
 
         # get level 2a (ramp.fits) data
-        try:
-            self.stage1_dir = os.path.join(self.data_dir, 'stage1')
-            self.stage1_filepath = os.path.join(self.stage1_dir,self.file)
-        except:
-            print("Cannot find the Stage 1 file")
+        self.stage1_filepath = os.path.abspath(self.file)
+        if not os.path.exists(self.stage1_filepath):
+            print(f"Cannot find the Stage 1 file: {self.stage1_filepath}")
 
         # get level 2b (cal.fits) data
         try:
-            self.stage2_dir = os.path.join(self.data_dir, 'stage2')
-            # self.stage2_filepath = os.path.join(self.stage2_dir,self.obs_id)
-            self.stage2_filepath = os.path.join(self.stage2_dir,self.name,obs_n + suffix2)
-            self.do_flux_cal = True
+            self.stage2_filepath = os.path.join(self.data_dir, obs_n + suffix2)
+            self.do_flux_cal = os.path.exists(self.stage2_filepath)
+            if not self.do_flux_cal:
+                print("Cannot find the Stage 2 file --- No flux calibration will be performed")
         except:
             print("Cannot find the Stage 2 file --- No flux calibration will be performed")
             self.do_flux_cal = False
@@ -622,7 +625,7 @@ class Jurassic():
         threshold used to be 47000 but that let things pass through that we didn't want
         """
         # load general miri mask
-        mask = np.load('full_MIRI_mask.npy') # for full array
+        mask = np.load(os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy'))
 
         # mask out pixels that get counts above threshold
         mask_sat = self.rampy_cube[-1] < threshold
