@@ -833,21 +833,18 @@ class Jurassic():
         # make cut for >= threshold
         bool_rolling_sum_cube = rolling_sum_cube >= threshold
 
-        # insert NaN frames here to keep cadence
-        nan_slice = np.full((rows,cols),np.nan)
-        false_slice = np.full((rows,cols),False)
+        # reinsert bad frames at their original positions by pre-allocating
+        # the full arrays and index-assigning the good frame values
+        n_total = self.bool_threshold_cube.shape[0]
+        good_idx = [i for i in range(n_total) if i not in set(self.bad_frames)]
 
-        i = 0
-        while i < len(self.bad_frames):
-            if i % 2 == 0:
-                #insert before itself - ik this doesn't make sense, trust me
-                rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
-                bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
-            else:
-                #insert after itself - I drew a little diagram to work this out (i now have no clue where this diag is)
-                rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
-                bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
-            i += 1
+        rolling_sum_full = np.full((n_total, rows, cols), np.nan)
+        bool_rolling_sum_full = np.zeros((n_total, rows, cols), dtype=bool)
+        rolling_sum_full[good_idx] = rolling_sum_cube
+        bool_rolling_sum_full[good_idx] = bool_rolling_sum_cube
+
+        rolling_sum_cube = rolling_sum_full
+        bool_rolling_sum_cube = bool_rolling_sum_full
 
         self.rolling_sum_cube = rolling_sum_cube
         self.bool_rolling_sum_cube = bool_rolling_sum_cube
@@ -1058,10 +1055,11 @@ class Jurassic():
                 # Aperture LC using filter FWHM as radius (buffer = floor(fwhm))
                 buf = int(np.floor(self.fwhm))
 
-                f = np.nansum(self.clean_cube[:,
-                                              max(0, y - buf):min(self.clean_cube.shape[1], y + buf + 1),
-                                              max(0, x - buf):min(self.clean_cube.shape[2], x + buf + 1)],
-                              axis=(1, 2))
+                aperture = self.clean_cube[:,
+                                           max(0, y - buf):min(self.clean_cube.shape[1], y + buf + 1),
+                                           max(0, x - buf):min(self.clean_cube.shape[2], x + buf + 1)]
+                all_nan = np.all(np.isnan(aperture), axis=(1, 2))
+                f = np.where(all_nan, np.nan, np.nansum(aperture, axis=(1, 2)))
                 if lc_units == 'dn/s':
                     f = f / group_time_s
 
@@ -1101,7 +1099,7 @@ class Jurassic():
                 ylims = ax[1].get_ylim()
                 ax[1].set_ylim(ylims[0], ylims[1] + abs(ylims[0] - ylims[1]))
                 ax[1].set_xlim(np.min(time), np.max(time))
-                ax[1].set_title(f'{self.filename}   |   ObjID: {objid}', fontsize=15)
+                ax[1].set_title(f'ObjID: {objid}', fontsize=15)
                 ax[1].set_ylabel('DN/s' if lc_units == 'dn/s' else 'DN/group', fontsize=15, labelpad=10)
                 ax[1].set_xlabel(f'Time (MJD - {np.round(mjd_arr[0], 3)})', fontsize=15)
 
@@ -1159,12 +1157,22 @@ class Jurassic():
                 ax[3].get_xaxis().set_visible(False)
                 ax[3].get_yaxis().set_visible(False)
 
-                # 20 frames later (or last available frame)
-                after = min(brightestframe + 20, len(cutout_image) - 1)
+                # 20 non-NaN frames after; fall back to 20 non-NaN frames before
+                valid_after = [i for i in range(brightestframe + 1, len(cutout_image))
+                               if not np.all(np.isnan(cutout_image[i]))]
+                if len(valid_after) >= 20:
+                    after = valid_after[19]
+                else:
+                    valid_before = [i for i in range(brightestframe)
+                                    if not np.all(np.isnan(cutout_image[i]))]
+                    after = valid_before[-20] if len(valid_before) >= 20 else (valid_before[0] if valid_before else brightestframe)
+
+                offset = after - brightestframe
+                after_label = f'+{offset}' if offset >= 0 else str(offset)
 
                 ax[3].imshow(cutout_image[after], cmap='gray', origin='lower',
                              vmin=vmin, vmax=vmax)
-                ax[3].set_title(f'Frame +{after - brightestframe}', fontsize=15)
+                ax[3].set_title(f'Frame {after_label}', fontsize=15)
                 ax[3].annotate('', xy=(0.2, 1.15), xycoords='axes fraction', xytext=(0.2, 1.),
                                arrowprops=dict(arrowstyle="<|-", color='r', lw=3))
                 ax[3].annotate('', xy=(0.8, 1.15), xycoords='axes fraction', xytext=(0.8, 1.),
