@@ -926,47 +926,125 @@ class Jurassic():
         return output
 
 
-    def asteroid_candidate(self, df,threshold_1=10,threshold_2=5,threshold_3=2):
+    def asteroid_candidate(self, df, threshold_1=10, threshold_2=5, threshold_3=2):
         """
-        Determines if in the grouped detections there are any potential asteroids
-        A potential asteroid has travelled a distance greater than 'threshold'.
-        Now updated to include different thresholds
+        Determines if in the grouped detections there are any potential asteroids.
+        Uses trajectory-based classification from _tag_asteroids when available,
+        otherwise falls back to displacement grading.
         """
+        ids = []
+
+        if 'asteroid_id' in df.columns and (df['asteroid_id'] > 0).any():
+            for ast_id in sorted(df[df['asteroid_id'] > 0]['asteroid_id'].unique()):
+                obj = df[df['asteroid_id'] == ast_id].sort_values('frame')
+                objid = int(obj['objid'].iloc[0])
+                x0, y0 = obj.iloc[0]['x'], obj.iloc[0]['y']
+                ids.append(f'Asteroid ID {ast_id}, Object: {objid}, '
+                           f'Start Coords: ({x0:.2f},{y0:.2f})')
+            return len(ids), ids
+
+        # Fallback: displacement grading
         num_candidates_1 = 0
         num_candidates_2 = 0
         num_candidates_3 = 0
-        ids = []
 
-        for id in range(1, df['objid'].max()+1):
+        for id in range(1, df['objid'].max() + 1):
             df_obj = df[df['objid'] == id]
-
             if len(df_obj) < 2:
                 continue
-
             try:
                 idx_min = df_obj['frame'].idxmin()
                 idx_max = df_obj['frame'].idxmax()
             except ValueError:
                 continue
-
             row_min = df_obj.loc[idx_min]
             row_max = df_obj.loc[idx_max]
+            dist = np.sqrt((row_max['x'] - row_min['x'])**2 +
+                           (row_max['y'] - row_min['y'])**2)
+            if dist > threshold_1:
+                num_candidates_1 += 1
+                ids.append(f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
+            elif dist > threshold_2:
+                num_candidates_2 += 1
+                ids.append(f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
+            elif dist > threshold_3:
+                num_candidates_3 += 1
+                ids.append(f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
 
-            dist = np.sqrt((row_max['x']-row_min['x'])**2 +
-                           (row_max['y']-row_min['y'])**2)
+        return num_candidates_1 + num_candidates_2 + num_candidates_3, ids
 
-            if  dist > threshold_1:
-                num_candidates_1+=1
-                ids.append((f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
-            if dist < threshold_1 and dist > threshold_2:
-                num_candidates_2+=1
-                ids.append((f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
-            if dist < threshold_2 and dist > threshold_3:
-                num_candidates_3+=1
-                ids.append((f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
 
-        return num_candidates_1+num_candidates_2+num_candidates_3, ids
-    
+    def _tag_asteroids(self, df, min_frames=5, min_displacement_px=2.0,
+                       max_residual_px=3.0, link_eps_px=5.0, min_track_frames=10):
+        """
+        Classifies objects as asteroids by fitting a linear trajectory (x, y vs mjd).
+        Objects with significant displacement and low trajectory residuals are flagged.
+        Nearby objects that fall on the same trajectory are linked with a shared asteroid_id.
+        Adds 'classification' and 'asteroid_id' columns.
+        """
+        from scipy import stats as scipy_stats
+
+        df = df.copy()
+        df['classification'] = 'Unknown'
+        df['asteroid_id'] = -1
+
+        objids = sorted([oid for oid in df['objid'].unique() if oid > 0])
+        tracks = {}
+
+        for objid in objids:
+            obj = df[df['objid'] == objid].sort_values('mjd')
+            if len(obj) < min_frames:
+                continue
+            x_vals = obj['x'].values
+            y_vals = obj['y'].values
+            mjd_vals = obj['mjd'].values
+            dist = np.sqrt((x_vals[-1] - x_vals[0])**2 + (y_vals[-1] - y_vals[0])**2)
+            if dist < min_displacement_px:
+                continue
+            t_ref = mjd_vals.mean()
+            t = mjd_vals - t_ref
+            slope_x, intercept_x, *_ = scipy_stats.linregress(t, x_vals)
+            slope_y, intercept_y, *_ = scipy_stats.linregress(t, y_vals)
+            pred_x = intercept_x + slope_x * t
+            pred_y = intercept_y + slope_y * t
+            rms = np.sqrt(np.mean((x_vals - pred_x)**2 + (y_vals - pred_y)**2))
+            if rms < max_residual_px:
+                tracks[objid] = dict(slope_x=slope_x, intercept_x=intercept_x,
+                                     slope_y=slope_y, intercept_y=intercept_y,
+                                     t_ref=t_ref, rms=rms)
+
+        if not tracks:
+            return df
+
+        # Link nearby non-asteroid objids onto existing trajectories
+        asteroid_objids = set(tracks.keys())
+        other_objids = set(objids) - asteroid_objids
+        assigned = {oid: oid for oid in asteroid_objids}
+
+        for other_oid in other_objids:
+            obj = df[df['objid'] == other_oid]
+            x_c = obj['x'].mean()
+            y_c = obj['y'].mean()
+            t_c = obj['mjd'].mean()
+            for leader_oid, tr in tracks.items():
+                dt = t_c - tr['t_ref']
+                pred_x = tr['intercept_x'] + tr['slope_x'] * dt
+                pred_y = tr['intercept_y'] + tr['slope_y'] * dt
+                if np.sqrt((x_c - pred_x)**2 + (y_c - pred_y)**2) < link_eps_px:
+                    assigned[other_oid] = leader_oid
+                    break
+
+        leaders = sorted(set(assigned.values()))
+        id_map = {leader: i + 1 for i, leader in enumerate(leaders)}
+
+        for oid, leader in assigned.items():
+            mask = df['objid'] == oid
+            if mask.sum() >= min_track_frames:
+                df.loc[mask, 'classification'] = 'Asteroid'
+                df.loc[mask, 'asteroid_id'] = id_map[leader]
+
+        return df
+
 
     def _time_mjd(self):
         """
@@ -1243,6 +1321,7 @@ class Jurassic():
             self.events = self.events.sort_values(by=['objid', 'frame'], ascending=[True, True])
             self.events = self._temporal_group(self.events)
             self.events = self.assign_mjd(self.events)
+            self.events = self._tag_asteroids(self.events)
             self.events.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
             if self.plot and len(self.events) > 0:
                 self.plot_detection(os.path.join(self.grouped_dir, 'detection_figures_sep'))
