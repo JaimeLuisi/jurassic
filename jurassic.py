@@ -429,7 +429,8 @@ class Jurassic():
         
         if run:
             self._assign_data()
-            self.correct_bfe_rcd(cube=self.data)
+            self.flux_calibrate(cube=self.data)
+            self.correct_bfe_rcd(cube=self.flux_data)
             self._make_cubes()
             self._mask_pixels()
 
@@ -544,6 +545,7 @@ class Jurassic():
             self.dq_3d_arr = hdul[3].data # data quality flag array for each group
             times = hdul[7].data
             self.time_df = pd.DataFrame(times)
+            self.tgroup = hdul['PRIMARY'].header['TGROUP']
             self.filename = hdul[0].header['FILENAME']
             self.filter = hdul[0].header['FILTER']
             self.subarray = hdul[0].header['SUBARRAY']
@@ -564,6 +566,42 @@ class Jurassic():
             self.fwhm = self.psf_fwhm_px[self.filter]
         except:
             print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
+
+    
+    def flux_calibrate(self,cube):
+        """
+        Calibrates the 4-dimensional ramp data (self.data)
+        Using the information from the reference files
+        with the data model: MirImgPhotomModel
+        """
+        # first get the conversion factor from the reference files
+        from jwst import datamodels
+        from stpipe import crds_client
+
+        with datamodels.open(self.stage1_filepath) as model:
+            crds_params = model.get_crds_parameters()
+            filt = model.meta.instrument.filter
+
+        # get the photom reference file from CRDS that corresponds to this exposure
+        photom_file = crds_client.get_reference_file(crds_params, 'photom', 'jwst')
+        print(f"Using PHOTOM ref: {photom_file}")
+
+        # open file and get information that matches the filter
+        with datamodels.MirImgPhotomModel(photom_file) as phot:
+            table = phot.phot_table
+            mask = table['filter'] == filt
+            row = table[mask]
+            photmjsr = float(row['photmjsr'][0])
+            uncertainty = float(row['uncertainty'][0])
+            print(f"{self.stage1_filepath}  filter={filt}  PHOTMJSR={photmjsr:.4f} MJy/sr per DN/s  +/- {uncertainty:.4f}")
+        self.flux_conv = photmjsr
+        self.flux_uncert = uncertainty
+
+        # apply the conversion to science data - first need to change from DN/group to DN/s
+        group_times = np.arange(1,self.n_group+1) * self.tgroup
+        data_rate = cube / group_times[np.newaxis,:,np.newaxis,np.newaxis] # DN/s
+
+        self.flux_data = data_rate * self.flux_conv # MJy/sr
 
 
     def correct_bfe_rcd(self, cube, A_bfe=1.035e-6, alpha_bfe=2.797,
@@ -1515,8 +1553,6 @@ class Jurassic():
         """
         outputs i wanna save (from themselves)
         """
-        from collections import Counter
-
         def safe_max(series):
             """
             Returns max if there is one, returns 0 otherwise
@@ -1560,10 +1596,14 @@ class Jurassic():
                 self.plot_detection(os.path.join(self.grouped_dir, 'detection_figures_sep'))
             num_candidates, data = self.asteroid_candidate(self.events)
 
-        g_tot_sep_df = self._spatial_group(self.total_df)
-        g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
-        g_tot_sep_df = self._temporal_group(g_tot_sep_df)
-        g_tot_sep_df = self.assign_mjd(g_tot_sep_df)
+        if len(self.total_df) > 0:
+            g_tot_sep_df = self._spatial_group(self.total_df)
+            g_tot_sep_df = g_tot_sep_df.sort_values(by=['objid', 'frame'], ascending=[True, True])
+            g_tot_sep_df = self._temporal_group(g_tot_sep_df)
+            g_tot_sep_df = self.assign_mjd(g_tot_sep_df)
+        else:
+            g_tot_sep_df = self.total_df.copy()
+            g_tot_sep_df['objid'] = pd.Series(dtype=int)
         filepath = os.path.join(self.grouped_dir, 'grouped_total_sep.csv')
         g_tot_sep_df.to_csv(filepath, index=False)
 
@@ -1611,5 +1651,5 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-for file in glob.glob('/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/ast5/*ramp.fits'):
+for file in glob.glob('/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/sextans-a/*ramp.fits'):
     Jurassic(file, method='mega', num_cores=55)
