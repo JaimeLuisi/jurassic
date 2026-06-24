@@ -59,226 +59,6 @@ def linear_fitting(coords,cube,n_int,n_group):
     return [row, col, grads, intercepts, resids]
 
 
-def fit_bfe_params(cube, alpha_bfe=2.797, bg_mask=None, sci_mask=None,
-                   bfe_early_groups=None, bfe_late_groups=None,
-                   ap_radius=5, cut=20, fit_r=None, verbose=False):
-    """
-    Find the brightest source in the image and fit A_bfe via the forward model.
-
-    Uses SEP to locate the source, fits the reset-decay parameters (tau,
-    rate_map, Adec_map) from the median gradient, then fits A_bfe by
-    minimising the residual between the modelled and observed late−early
-    normalised PSF difference. alpha_bfe is held fixed.
-
-    The forward model runs on a cropped region around the star to keep
-    the fftconvolve tractable on large detectors.
-
-    Parameters
-    ----------
-    cube : ndarray (n_int, n_groups, ny, nx), float
-        Raw ramp cube.
-    alpha_bfe : float
-        BFE kernel power-law index (fixed during fit, default 2.783).
-    bg_mask : ndarray (ny, nx) bool, optional
-        True = background pixels for tau fitting. If None an annulus around
-        the detected source is used.
-    sci_mask : ndarray (ny, nx) bool, optional
-        True = good science pixels. Passed to SEP to exclude bad pixels.
-    bfe_early_groups : list of int, optional
-        Gradient indices defining early groups for the PSF difference.
-        Default: groups 1 to min(3, n_grads//4).
-    bfe_late_groups : list of int, optional
-        Gradient indices defining late groups for the PSF difference.
-        Default: last three valid gradients.
-    ap_radius : float
-        Aperture radius in pixels for PSF normalisation.
-    cut : int
-        Half-size of the PSF cutout in pixels.
-    fit_r : float
-        Radius in pixels within the cutout used for chi-squared fitting.
-    verbose : bool
-
-    Returns
-    -------
-    A_bfe : float
-        Fitted BFE amplitude.
-    sx, sy : int
-        Detected star position (x, y).
-    """
-    import sep
-    from scipy.signal import fftconvolve
-
-    cube = np.asarray(cube, dtype=float)
-    n_int, n_groups, ny, nx = cube.shape
-    n_grads = n_groups - 2
-    g_arr = np.arange(n_grads, dtype=float)
-
-    grads = np.diff(cube, axis=1)[:, :n_grads]
-    med_grad = np.median(grads, axis=0)
-
-    # Detect brightest round source (excludes elongated edge artifacts)
-    detect_img = np.median(grads[:, 1:n_grads], axis=(0, 1)).astype(np.float64)
-    sep_mask = (~sci_mask.astype(bool)) if sci_mask is not None else None
-    bkg = sep.Background(detect_img, mask=sep_mask)
-    img_sub = (detect_img - bkg.back()).astype(np.float64)
-    objects = sep.extract(img_sub, thresh=5.0, err=bkg.globalrms, mask=sep_mask)
-    edge = 20
-    interior = ((objects['x'] > edge) & (objects['x'] < nx - edge) &
-                (objects['y'] > edge) & (objects['y'] < ny - edge))
-    round_sources = objects[interior & (objects['a'] / objects['b'] < 3)]
-    if len(round_sources) == 0:
-        round_sources = objects[interior]
-    if len(round_sources) == 0:
-        round_sources = objects
-    if len(round_sources) == 0 or round_sources[np.argsort(round_sources['flux'])[-1]]['flux'] < 50000:
-        if verbose:
-            print('  No source meets brightness threshold — skipping BFE fit')
-        return None, nx // 2, ny // 2
-    round_sources = round_sources[np.argsort(round_sources['flux'])[::-1]]
-    star = round_sources[0]
-    sy, sx = int(round(star['y'])), int(round(star['x']))
-    if verbose:
-        print(f'  Brightest source at x={sx}, y={sy}  flux={star["flux"]:.0f}')
-
-    # Background mask for tau fitting
-    yy_full, xx_full = np.mgrid[:ny, :nx]
-    r_star = np.sqrt((yy_full - sy)**2 + (xx_full - sx)**2)
-    if bg_mask is not None:
-        _bg = bg_mask.astype(bool)
-    else:
-        _bg = (r_star > 15) & (r_star < min(ny, nx) // 3)
-        if sci_mask is not None:
-            _bg &= sci_mask.astype(bool)
-
-    mean_bg = np.nanmean(med_grad[1:, _bg], axis=1)
-    def _exp1(g, C, A, t): return C + A * np.exp(-g / t)
-    popt, _ = curve_fit(_exp1, g_arr[1:], mean_bg,
-                        p0=[mean_bg[-1], mean_bg[0] - mean_bg[-1], 1.5])
-    tau = float(popt[2])
-    if verbose:
-        print(f'  tau = {tau:.4f} groups')
-
-    exp_g = np.exp(-g_arr / tau)
-    ff_col = np.zeros(n_grads); ff_col[0] = -1.0
-    X = np.column_stack([np.ones(n_grads), exp_g, ff_col])
-    params, _, _, _ = np.linalg.lstsq(X, med_grad.reshape(n_grads, -1), rcond=None)
-    rate_map = params[0].reshape(ny, nx)
-    Adec_map = params[1].reshape(ny, nx)
-    delta_map = params[2].reshape(ny, nx)
-
-    # Crop to a region around the star for the forward model
-    kh = 20
-    crop = cut + kh + 30
-    y0, y1 = max(0, sy - crop), min(ny, sy + crop + 1)
-    x0, x1 = max(0, sx - crop), min(nx, sx + crop + 1)
-    rate_c = rate_map[y0:y1, x0:x1]
-    Adec_c = Adec_map[y0:y1, x0:x1]
-    delta_c = delta_map[y0:y1, x0:x1]
-    grads_c = grads[:, :, y0:y1, x0:x1]
-    cy, cx = sy - y0, sx - x0   # star position in cropped frame
-    nyc, nxc = rate_c.shape
-
-    # Group selections: skip group 1 (still affected by first-frame residuals)
-    # use 2-3 groups from the early/late thirds of the valid ramp
-    if bfe_early_groups is None:
-        n_e = max(2, min(3, n_grads // 4))
-        start = 1 if n_grads < 8 else 2
-        bfe_early_groups = list(range(start, start + n_e))
-    if bfe_late_groups is None:
-        n_e = max(2, min(3, n_grads // 4))
-        bfe_late_groups = list(range(n_grads - n_e, n_grads))
-
-    _ap_yy, _ap_xx = np.mgrid[:2*cut+1, :2*cut+1]
-    _ap_mask = np.sqrt((_ap_yy - cut)**2 + (_ap_xx - cut)**2) <= ap_radius
-
-    def _cutout(arr_3d, glist):
-        stack = np.median(arr_3d[np.array(glist)], axis=0)
-        c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
-        return c / c[_ap_mask].sum()
-
-    def _cutout_perint(arr_4d, glist):
-        gl = np.array(glist)
-        cuts = []
-        for i in range(arr_4d.shape[0]):
-            stack = np.median(arr_4d[i, gl], axis=0)
-            c = stack[cy-cut:cy+cut+1, cx-cut:cx+cut+1]
-            cuts.append(c / c[_ap_mask].sum())
-        return np.array(cuts)
-
-    diff_perint = (_cutout_perint(grads_c, bfe_late_groups)
-                   - _cutout_perint(grads_c, bfe_early_groups))
-    obs_diff = np.median(diff_perint, axis=0)
-    noise_diff = np.std(diff_perint, axis=0) / np.sqrt(n_int)
-    noise_diff = np.clip(noise_diff, noise_diff[noise_diff > 0].min() * 0.1, None)
-
-    yy_c, xx_c = np.mgrid[:2*cut+1, :2*cut+1]
-    r_map_c = np.sqrt((yy_c - cut)**2 + (xx_c - cut)**2)
-
-    if fit_r is None:
-        snr_profile = np.array([
-            np.mean(np.abs(obs_diff[np.round(r_map_c).astype(int) == ri])) /
-            np.mean(noise_diff[np.round(r_map_c).astype(int) == ri])
-            for ri in range(1, cut)
-        ])
-        above = np.where(snr_profile > 2.0)[0]
-        fit_r = max(5, int(above[-1]) + 1) if len(above) > 0 else 5
-        if verbose:
-            print(f'  Auto fit_r = {fit_r} px (SNR-based)')
-
-    fit_mask = r_map_c <= fit_r
-
-    ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
-    r = np.sqrt(ii**2 + jj**2)
-
-    def _make_kernel(al):
-        with np.errstate(divide='ignore', invalid='ignore'):
-            Kk = np.where(r > 0, -1.0 / r**al, 0.0)
-        Kk[kh, kh] = -Kk.sum()
-        return Kk
-
-    def _simulate(A_bfe_val, al=alpha_bfe):
-        Kk = _make_kernel(al)
-        Q = np.zeros((nyc, nxc))
-        grads_s = np.zeros((n_grads, nyc, nxc))
-        for g in range(n_grads):
-            tg = rate_c + Adec_c * np.exp(-g / tau)
-            if g == 0:
-                tg = tg - delta_c
-            KQ = fftconvolve(Q, Kk, mode='same')
-            grads_s[g] = tg * (1.0 - A_bfe_val * KQ)
-            Q += tg
-        return grads_s
-
-    if alpha_bfe is None:
-        from scipy.optimize import minimize as _minimize
-        alpha0 = 2.797
-
-        def _objective_2d(p):
-            log_A, al = p
-            grads_s = _simulate(10**log_A, al)
-            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
-            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
-
-        res = _minimize(_objective_2d, x0=[np.log10(1e-6), alpha0], method='Powell',
-                        options={'xtol': 1e-8, 'ftol': 1e-12, 'maxiter': 50000})
-        log_A_fit, alpha_fit = res.x
-        A_bfe_fit = 10**log_A_fit
-        if verbose:
-            print(f'  A_bfe = {A_bfe_fit:.4e}  alpha = {alpha_fit:.4f}  (both fitted)')
-        return A_bfe_fit, alpha_fit, sx, sy
-    else:
-        def _objective(log_A):
-            grads_s = _simulate(10**log_A)
-            sim_diff = _cutout(grads_s, bfe_late_groups) - _cutout(grads_s, bfe_early_groups)
-            return np.sum((((sim_diff - obs_diff) / noise_diff)[fit_mask])**2)
-
-        result = minimize_scalar(_objective, bounds=(-9, -4), method='bounded')
-        A_bfe_fit = 10**result.x
-        if verbose:
-            print(f'  A_bfe = {A_bfe_fit:.4e}  (alpha fixed at {alpha_bfe})')
-        return A_bfe_fit, sx, sy
-
-
 def run_lacosmic(frame_data, mask):
     """
     running lacosmic so it can be done parallely on frames
@@ -394,7 +174,8 @@ class Jurassic():
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
 
-    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,significance=True,mask_correction=True,plot=True):
+    def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,
+                 significance=True,mask_correction=True,plot=True,no_sat_mask=False):
         """
         Initialise or whatevs
 
@@ -414,6 +195,7 @@ class Jurassic():
         self.method = method
         self.plot = plot
         self.mask_correction = mask_correction
+        self.no_sat_mask = no_sat_mask
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
             "F560W": 1.882,
@@ -429,8 +211,8 @@ class Jurassic():
         
         if run:
             self._assign_data()
-            self.flux_calibrate(cube=self.data)
-            self.correct_bfe_rcd(cube=self.flux_data)
+            self.ramp_correction(cube=self.data)
+            self.flux_calibrate(cube=self.data_cor)
             self._make_cubes()
             self._mask_pixels()
 
@@ -497,7 +279,7 @@ class Jurassic():
         Opens the fits file and assigns the data to the class
         """
         # base outputs folder (cwd)
-        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs')
+        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs', self.name)
         os.makedirs(self.base_dir, exist_ok=True)
 
         self.data_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic','pipeline_data/Obs')
@@ -510,7 +292,7 @@ class Jurassic():
         else:
             obs_n = self.obs_id  # fallback
 
-        obs_name = f"bfe_{obs_n}" 
+        obs_name = f"dr_{obs_n}" 
 
         # directory for specific observation/segment
         self.obs_dir = os.path.join(self.base_dir, obs_name)
@@ -568,6 +350,18 @@ class Jurassic():
             print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
 
     
+    def ramp_correction(self,cube):
+        """
+        Uses rampdoctor to correct both the brighter-fatter effect
+        and the reset switch charge decay effects
+        """
+        from rampdoctor import RampDoctor
+        self.gen_mask = np.load('full_MIRI_mask.npy') # for full array
+        rd = RampDoctor(cube=cube,bg_mask=self.gen_mask,verbose=True)
+
+        self.data_cor = rd.correct(diagnostics=True) 
+
+
     def flux_calibrate(self,cube):
         """
         Calibrates the 4-dimensional ramp data (self.data)
@@ -604,175 +398,17 @@ class Jurassic():
         self.flux_data = data_rate * self.flux_conv # MJy/sr
 
 
-    def correct_bfe_rcd(self, cube, A_bfe=1.035e-6, alpha_bfe=2.797,
-                        bg_mask=None, late_groups=None, verbose=False,
-                        fit_bfe=False, sci_mask=None,
-                        bfe_early_groups=None, bfe_late_groups=None,
-                        ap_radius=5, cut=20, fit_r=10):
-        """
-        Joint BFE + reset-decay correction for MIRI ramp data.
-
-        Three sequential steps applied to gradients:
-        1. Causal BFE inversion: each gradient is divided by (1 - A_bfe * K⊛Q)
-            where Q is the accumulated charge from all previous groups.
-        2. Parametric RCD subtraction: fit C + A*exp(-g/tau) with tau global
-            (from background pixels) and [A, C, delta] per pixel via lstsq.
-            Subtract the fitted decay from every integration.
-        3. Non-parametric residual removal: subtract the per-pixel per-group
-            median over integrations, then add back the flat rate estimated from
-            late groups. Removes any residual group-correlated structure not
-            captured by the exponential model.
-
-        The last gradient (last-frame anomaly) is BFE-corrected but excluded from
-        the RCD and median subtraction steps, matching the convention in
-        correct_reset_decay.
-
-        Parameters
-        ----------
-        cube : ndarray (n_int, n_groups, ny, nx), float
-            Raw SCI data from uncal.fits.
-        A_bfe : float
-            BFE kernel amplitude (default 1.035e-6).
-        alpha_bfe : float
-            BFE kernel power-law index (default 2.783).
-        bg_mask : ndarray (ny, nx) bool, optional
-            True = background pixels used to fit the global RCD timescale tau.
-            If None, all pixels are used.
-        late_groups : list of int, optional
-            Gradient indices used to estimate the flat rate for median subtraction.
-            Defaults to the last three good gradients.
-        verbose : bool
-            Print BFE inversion progress.
-        fit_bfe : bool
-            If True, ignore A_bfe and fit it from the brightest source using
-            fit_bfe_params before applying the correction.
-        sci_mask : ndarray (ny, nx) bool, optional
-            True = good science pixels. Passed to fit_bfe_params for SEP source
-            detection. Only used when fit_bfe=True.
-        bfe_early_groups, bfe_late_groups : list of int, optional
-            Gradient indices for the early/late PSF groups used in the BFE fit.
-            Only used when fit_bfe=True.
-        ap_radius, cut, fit_r : float
-            PSF normalisation aperture, cutout half-size, and fit radius in pixels.
-            Only used when fit_bfe=True.
-
-        Returns
-        -------
-        cube_cor : ndarray (n_int, n_groups, ny, nx)
-            Corrected SCI cube reconstructed from corrected gradients.
-            Group 0 is unchanged (reset level reference).
-        """
-        from scipy.signal import fftconvolve
-
-        cube = np.asarray(cube, dtype=float)
-        n_int, n_groups, ny, nx = cube.shape
-        n_grads_all = n_groups - 1        # all gradients
-        n_grads = n_groups - 2            # gradients to correct (exclude last-frame anomaly)
-
-        grads_raw = np.diff(cube, axis=1)   # (n_int, n_grads_all, ny, nx)
-        g_arr = np.arange(n_grads, dtype=float)
-
-        if late_groups is None:
-            late_groups = list(range(n_grads - 3, n_grads))
-
-        if fit_bfe:
-            if verbose:
-                print('Fitting A_bfe from brightest source...')
-            fit_result = fit_bfe_params(
-                cube, alpha_bfe=alpha_bfe,
-                bg_mask=bg_mask, sci_mask=sci_mask,
-                bfe_early_groups=bfe_early_groups, bfe_late_groups=bfe_late_groups,
-                ap_radius=ap_radius, cut=cut, fit_r=fit_r, verbose=verbose)
-            A_bfe_fit, _sx, _sy = fit_result
-            if A_bfe_fit is None:
-                if verbose:
-                    print('No source meets brightness threshold — skipping BFE correction')
-                A_bfe = 0.0
-            else:
-                A_bfe = A_bfe_fit
-                if verbose:
-                    print(f'Using fitted A_bfe={A_bfe:.4e} at x={_sx}, y={_sy}')
-
-        # Step 1: causal iterative BFE correction — flux conserving
-        # Forward model: grad_obs = true_grad - A * K ⊛ (Q * true_grad)
-        # Iterative inversion: true_grad^(n+1) = grad_obs + A * K ⊛ (Q * true_grad^(n))
-        # Since K sums to zero, K̂(0)=0 → total image flux is exactly conserved.
-        N_ITER = 3
-        kh = 20
-        ii, jj = np.mgrid[-kh:kh+1, -kh:kh+1].astype(float)
-        r = np.sqrt(ii**2 + jj**2)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            K = np.where(r > 0, -1.0 / r**alpha_bfe, 0.0)
-        K[kh, kh] = -K.sum()
-
-        grads_bfe = grads_raw.copy()
-        Q_med = np.zeros((ny, nx))
-        for g in range(n_grads_all):
-            if g > 0:
-                Q_med = Q_med + np.median(grads_bfe[:, g-1], axis=0)
-            med_obs_g = np.median(grads_raw[:, g], axis=0)
-            true_grad_est = med_obs_g.copy()
-            for _ in range(N_ITER):
-                true_grad_est = med_obs_g + A_bfe * fftconvolve(Q_med * true_grad_est, K, mode='same')
-            KQg = fftconvolve(Q_med * true_grad_est, K, mode='same')
-            grads_bfe[:, g] = grads_raw[:, g] + A_bfe * KQg[None]
-            if verbose:
-                print(f'  BFE g={g}', end='\r')
-        if verbose:
-            print()
-
-        # Step 2: fit global tau from BFE-corrected background, excluding g=0
-        med_bfe = np.median(grads_bfe[:, :n_grads], axis=0)   # (n_grads, ny, nx)
-        g_fit = g_arr[1:]
-        if bg_mask is not None:
-            mean_bg = np.nanmean(med_bfe[1:, bg_mask], axis=1)
-        else:
-            mean_bg = np.nanmean(med_bfe[1:].reshape(n_grads-1, -1), axis=1)
-
-        def _exp1(g, C, A, tau): return C + A * np.exp(-g / tau)
-        popt, _ = curve_fit(_exp1, g_fit, mean_bg,
-                            p0=[mean_bg[-1], mean_bg[0] - mean_bg[-1], 1.5])
-        tau = float(popt[2])
-
-        exp_g = np.exp(-g_arr / tau)
-        ff_col = np.zeros(n_grads); ff_col[0] = -1.0
-        X = np.column_stack([np.ones(n_grads), exp_g, ff_col])
-        params, _, _, _ = np.linalg.lstsq(
-            X, med_bfe.reshape(n_grads, -1), rcond=None)
-        Adec_map = params[1].reshape(ny, nx)
-        delta_map = params[2].reshape(ny, nx)
-
-        grads_joint = grads_bfe.copy()
-        for g in range(n_grads):
-            decay_g = Adec_map * np.exp(-g / tau)
-            if g == 0:
-                grads_joint[:, 0] = grads_bfe[:, 0] - decay_g[None] + delta_map[None]
-            else:
-                grads_joint[:, g] = grads_bfe[:, g] - decay_g[None]
-
-        # Step 3: non-parametric median subtraction
-        med_joint = np.median(grads_joint[:, :n_grads], axis=0)   # (n_grads, ny, nx)
-        C_hat = np.mean(med_joint[late_groups], axis=0)            # (ny, nx)
-
-        grads_cor = grads_joint.copy()
-        for g in range(n_grads):
-            grads_cor[:, g] = grads_joint[:, g] - med_joint[g][None] + C_hat[None]
-
-        # Reconstruct corrected cube: group 0 unchanged, integrate corrected gradients
-        cube_cor = cube.copy()
-        cube_cor[:, 1:] = cube[:, :1] + np.cumsum(grads_cor, axis=1)
-
-        self.data_cor = cube_cor
-
-
     def _make_cubes(self):
         """
         makes cube from 4d uncal file, also jump detected cube
         """
-        # make the rampy science data cube
-        ramps = np.array_split(self.data_cor,self.n_int,axis=0)
-        rampy_cube = np.concatenate(ramps,axis=1)
-        self.rampy_cube = np.squeeze(rampy_cube)
+        # DN cube (for saturation masking)
+        ramps_dn = np.array_split(self.data_cor, self.n_int, axis=0)
+        self.rampy_cube_dn = np.squeeze(np.concatenate(ramps_dn, axis=1))
+
+        # MJy/sr cube (for science)
+        ramps_flux = np.array_split(self.flux_data, self.n_int, axis=0)
+        self.rampy_cube = np.squeeze(np.concatenate(ramps_flux, axis=1))
 
         # make reference cube for jumps detected with calwebb_detector1
         dq_ints = np.array_split(self.dq_3d_arr,len(self.dq_3d_arr),axis=0)
@@ -811,10 +447,10 @@ class Jurassic():
         threshold used to be 47000 but that let things pass through that we didn't want
         """
         # load general miri mask
-        mask = np.load('full_MIRI_mask.npy') # for full array
+        mask = self.gen_mask # for full array
 
         # mask out pixels that get counts above threshold
-        mask_sat = self.rampy_cube[-1] < threshold
+        mask_sat = self.rampy_cube_dn[-1] < threshold
         mask_sat = mask_sat.astype(int) # to convolve with aperture
 
         kernel = self._circle_app(10)
@@ -835,8 +471,10 @@ class Jurassic():
 
         if self.subarray == 'FULL':
             self.mask_tot = mask_sat & mask
+            if self.no_sat_mask:
+                self.mask_tot = mask
         else:
-            self.mask_tot = mask_sat
+            self.mask_tot = mask_sat # need to add option here
 
         nan_mask = self.mask_tot * 1.0 
         nan_mask[nan_mask < 1] = np.nan
@@ -970,13 +608,18 @@ class Jurassic():
         Making a reference frame but more complicated to counteract smearing
         of bright asteroids. - Armin's suggestion (starts with original, then masks)
         """
-        no_nans = np.nansum(self.grad_cube,axis=(1,2)) > 0
-        no_nans[self.bad_frames] = False
+        # Use NaN fraction to make sure not a mostly NaN frame
+        nan_fraction = np.isnan(self.grad_cube).reshape(self.n_frame, -1).mean(axis=1)
+        not_nans = nan_fraction < 0.1
+        not_nans[self.bad_frames] = False
 
-        # masking out the all nan frames and the fake frames
-        good_slices = self.grad_cube.copy()[no_nans]
+        good_slices = self.grad_cube.copy()[not_nans]
 
-        self.first_ref_frame = np.nanmedian(good_slices,axis=0)
+        if len(good_slices) == 0:
+            raise RuntimeError("No valid frames found for reference frame — "
+                            "check grad_cube for all-NaN output.")
+
+        self.first_ref_frame = np.nanmedian(good_slices, axis=0)
 
         filepath = os.path.join(self.obs_dir, "ref_frame_1.npy")
         np.save(filepath, self.first_ref_frame)
@@ -1086,11 +729,12 @@ class Jurassic():
         self.source_mask = source_mask
 
         # Only use good frames (not bad/all-NaN)
-        no_nans = np.nansum(self.grad_cube, axis=(1, 2)) > 0
-        no_nans[self.bad_frames] = False
+        nan_fraction = np.isnan(self.grad_cube).reshape(self.n_frame, -1).mean(axis=1)
+        not_nans = nan_fraction < 0.1
+        not_nans[self.bad_frames] = False
 
-        good_slices = self.grad_cube.copy()[no_nans]
-        mask_slices = self.source_mask[no_nans]
+        good_slices = self.grad_cube.copy()[not_nans]
+        mask_slices = self.source_mask[not_nans]
 
         # NaN out source pixels, then make reference from median
         masked_slices = np.where(mask_slices, np.nan, good_slices)
@@ -1651,5 +1295,5 @@ class Jurassic():
             print('0 objects identified by significance')
 
 
-for file in glob.glob('/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/sextans-a/*ramp.fits'):
+for file in glob.glob('/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/ast6/*ramp.fits'):
     Jurassic(file, method='mega', num_cores=55)
