@@ -2,7 +2,10 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
-import stpsf
+try:
+    import stpsf
+except ModuleNotFoundError:
+    import webbpsf as stpsf
 import os
 import sep
 import glob
@@ -81,7 +84,69 @@ def run_lacosmic(frame_data, mask):
 
     return clean, crmask
 
-def _run_sep(frame, data, kernel, mask, save, obs_dir,n_group):
+def _psf_fit(data_sub, x, y, kernel):
+    """
+    Fit PSF centroid by minimizing sum((norm_stamp - shifted_psf)**2) via Powell.
+    Returns (psf_like, x_psf, y_psf):
+      psf_like  — Pearson r between stamp and best-fit shifted PSF
+      x_psf     — refined centroid x in image coordinates
+      y_psf     — refined centroid y in image coordinates
+    Returns (nan, x, y) if stamp is out of bounds or has no variance.
+    """
+    from scipy.optimize import minimize
+    from scipy.ndimage import shift as ndshift
+
+    h, w = data_sub.shape
+    hs = kernel.shape[0] // 2
+    xi, yi = int(round(x)), int(round(y))
+    y0, y1 = yi - hs, yi + hs + 1
+    x0, x1 = xi - hs, xi + hs + 1
+    if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
+        return np.nan, x, y
+
+    stamp = data_sub[y0:y1, x0:x1].astype(np.float64)
+    stamp_sub = stamp - np.nanmedian(stamp)
+    total = np.nansum(stamp_sub)
+    if total == 0:
+        return np.nan, x, y
+    stamp_norm = stamp_sub / total
+
+    psf_norm = kernel.astype(np.float64) / kernel.sum()
+
+    # initial offset: fractional part of SEP centroid from rounded integer
+    dx0 = x - xi
+    dy0 = y - yi
+
+    def residual(coeff):
+        shifted = ndshift(psf_norm, (coeff[1], coeff[0]), order=3, mode='constant', cval=0)
+        s = shifted.sum()
+        if s > 0:
+            shifted /= s
+        return float(np.nansum((stamp_norm - shifted) ** 2)) * 1e6
+
+    res = minimize(residual, [dx0, dy0], method='Powell',
+                   bounds=[(-1.0, 1.0), (-1.0, 1.0)])
+    dx_fit, dy_fit = res.x
+
+    psf_shifted = ndshift(psf_norm, (dy_fit, dx_fit), order=3, mode='constant', cval=0)
+    s = psf_shifted.sum()
+    if s > 0:
+        psf_shifted /= s
+
+    # compute r on inner core only (~2×FWHM), not the full noisy stamp
+    core_r = max(3, hs // 3)
+    cy, cx = hs, hs
+    core_sl = (slice(cy - core_r, cy + core_r + 1), slice(cx - core_r, cx + core_r + 1))
+    stamp_f = stamp_norm[core_sl].flatten()
+    psf_f = psf_shifted[core_sl].flatten()
+    if stamp_f.std() == 0 or psf_f.std() == 0:
+        return np.nan, x, y
+
+    r = float(np.corrcoef(stamp_f, psf_f)[0, 1])
+    return r, float(xi + dx_fit), float(yi + dy_fit)
+
+
+def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, psf_corr_thresh=0.8):
     """
     run source extractor in parallel
     """
@@ -100,13 +165,20 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir,n_group):
 
     if len(obj_df) == 0:
         # return empty filtered_df with same cols
-        filtered_df = pd.DataFrame(columns=obj_df.columns.tolist() + ['symmetry', 'frame', 'sep_flux', 'sep_fluxerr','sep_s/n', 'sep_flag'])
+        filtered_df = pd.DataFrame(columns=obj_df.columns.tolist() + ['symmetry', 'psf_like', 'frame', 'sep_flux', 'sep_fluxerr', 'sep_s/n', 'sep_flag'])
         return obj_df, filtered_df
 
     # adding needed cols
     obj_df['symmetry'] = (obj_df['a']/obj_df['b']).abs() - 1
     obj_df['frame'] = frame
     obj_df['group'] = (obj_df['frame'] % n_group) + 1 # adding the group number
+
+    # PSF fit: centroid refinement + shape correlation
+    psf_results = [_psf_fit(data_sub, row['x'], row['y'], kernel)
+                   for _, row in obj_df.iterrows()]
+    obj_df['psf_like'] = [r[0] for r in psf_results]
+    obj_df['x_psf']    = [r[1] for r in psf_results]
+    obj_df['y_psf']    = [r[2] for r in psf_results]
 
     # aperture photometry
     flux, fluxerr, flag = sep.sum_circle(data_sub, obj_df['x'], obj_df['y'], 3.0, err=bkg.globalrms, gain=1.0) # ap radius = 3.0
@@ -115,10 +187,16 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir,n_group):
     obj_df['sep_s/n'] = flux/fluxerr
     obj_df['sep_flag'] = flag
 
-    # apply filtering
-    filter_mask = ((obj_df['symmetry'] < 0.5) & # used to be 1.5
-                    obj_df['x'].between(16, 1016) &
-                    obj_df['y'].between(12, 1012))
+    # apply filtering: edge exclusion + PSF shape (correlation + fit didn't hit bound) + size
+    fit_dx = (obj_df['x_psf'] - obj_df['x']).abs()
+    fit_dy = (obj_df['y_psf'] - obj_df['y']).abs()
+    filter_mask = (obj_df['x'].between(16, 1016) &
+                   obj_df['y'].between(12, 1012) &
+                   (obj_df['psf_like'] >= psf_corr_thresh) &
+                   (fit_dx < 0.9) & (fit_dy < 0.9))
+    if psf_fwhm is not None:
+        sigma_exp = psf_fwhm / (2 * np.sqrt(2 * np.log(2)))
+        filter_mask = filter_mask & (obj_df['a'] < 2.0 * sigma_exp)
     filtered_df = obj_df[filter_mask]
 
     # plotting
@@ -175,7 +253,8 @@ class Jurassic():
     """
 
     def __init__(self,file=None,num_cores=35,run=True,method='mega',ramps=None,images=True,
-                 significance=True,mask_correction=True,plot=True,no_sat_mask=False):
+                 significance=False,mask_correction=True,plot=True,no_sat_mask=False,
+                 base_dir=None,data_dir=None,correct_ramps=True):
         """
         Initialise or whatevs
 
@@ -190,12 +269,17 @@ class Jurassic():
 
         other stuff I guess - will update at some point
         """
-        self.file = file.removeprefix('/home/phys/astronomy/jlu69/Masters/jurassic/pipeline_data/Obs/stage1/')
-        self.name, self.obs_id = self.file.split('/')
+        self.file = file
+        parts = self.file.replace('\\', '/').split('/')
+        self.name = parts[-2] if len(parts) >= 2 else '.'
+        self.obs_id = parts[-1]
         self.method = method
         self.plot = plot
+        self.base_dir = base_dir
+        self.data_dir = data_dir
         self.mask_correction = mask_correction
         self.no_sat_mask = no_sat_mask
+        self.correct_ramps = correct_ramps
         self.num_cores = num_cores # number of cores to use when running functions (sep, 1st order polyfit, lacosmic) in parallel
         self.psf_fwhm_px = { # taken from JDOX
             "F560W": 1.882,
@@ -211,10 +295,24 @@ class Jurassic():
         
         if run:
             self._assign_data()
-            self.ramp_correction(cube=self.data)
+            if self.correct_ramps:
+                self.ramp_correction(cube=self.data)
+            else:
+                self.data_cor = self.data
+                _mask_path = os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy')
+                full_mask = np.load(_mask_path)
+                ny, nx = self.data.shape[2], self.data.shape[3]
+                if full_mask.shape == (ny, nx):
+                    self.gen_mask = full_mask
+                else:
+                    r0 = self.substrt2 - 1
+                    c0 = self.substrt1 - 1
+                    self.gen_mask = full_mask[r0:r0+ny, c0:c0+nx]
             self.flux_calibrate(cube=self.data_cor)
             self._make_cubes()
+            del self.data, self.data_cor, self.flux_data
             self._mask_pixels()
+            del self.rampy_cube_dn, self.dq_cube
 
             if ramps: # search on ramp level
                 print('ramps')
@@ -223,8 +321,10 @@ class Jurassic():
             if self.method == 'mega':
                 if images or significance:
                     print('images')
-                    self.mega_inator(self.rampy_cube)          # use raw rampy_cube
+                    self.mega_inator(self.rampy_cube)
+                    del self.rampy_cube
                     self._cube_gradient(self.mega_cube_masked, save=True)
+                    del self.mega_cube, self.mega_cube_masked, self.fakey_cube
                     self._reference_frame()
                     self._cube_differenced(self.grad_cube, self.first_ref_frame, save=False, first=None)
                     self._psf_kernel()
@@ -233,15 +333,19 @@ class Jurassic():
                     print('re-difference')
                     self._masked_reference(self.mask_correction)
                     self._cube_differenced(self.grad_cube, self.second_ref_frame, save=True)
+                    del self.grad_cube
                     self._remove_cosmic(self.diff_cube)
+                    del self.diff_cube
                     self._make_ref_cr_mask()
                     self.source_extracting(self.clean_cube, save_plot=True, save_csv=False)
 
                 if significance:
                     print('significance')
                     self._cube_significance()
-                    self._cube_threshold() 
+                    self._cube_threshold()
+                    del self.sig_cube, self.conv_sig_cube
                     self._cube_rolling_sum()
+                    del self.bool_threshold_cube
                     self._significance_output()
             
             if self.method == 'ramp':
@@ -267,22 +371,25 @@ class Jurassic():
                     self._cube_rolling_sum()
                     self._significance_output()
 
-            self._time_mjd()
-            self.save_outputs()
-
             if not hasattr(self, 'significance_df'):
                 self.significance_df = pd.DataFrame()
+            self._time_mjd()
+            self._flux_calibrate()
+            self.save_outputs()
 
 
     def _assign_data(self):
         """
         Opens the fits file and assigns the data to the class
         """
-        # base outputs folder (cwd)
-        self.base_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic', 'outputs', self.name)
+        # base outputs folder — defaults to outputs/ relative to cwd
+        if self.base_dir is None:
+            self.base_dir = os.path.join(os.getcwd(), 'outputs')
         os.makedirs(self.base_dir, exist_ok=True)
 
-        self.data_dir = os.path.join('/home/phys/astronomy/jlu69/Masters/jurassic','pipeline_data/Obs')
+        # data folder — defaults to the directory containing the ramp file
+        if self.data_dir is None:
+            self.data_dir = os.path.dirname(os.path.abspath(self.file))
 
         # Remove the filename suffix
         suffix1 = '_mirimage_ramp.fits'
@@ -299,39 +406,64 @@ class Jurassic():
         os.makedirs(self.obs_dir, exist_ok=True)
 
         # get level 2a (ramp.fits) data
-        try:
-            self.stage1_dir = os.path.join(self.data_dir, 'stage1')
-            self.stage1_filepath = os.path.join(self.stage1_dir,self.file)
-        except:
-            print("Cannot find the Stage 1 file")
+        self.stage1_filepath = os.path.abspath(self.file)
+        if not os.path.exists(self.stage1_filepath):
+            print(f"Cannot find the Stage 1 file: {self.stage1_filepath}")
 
         # get level 2b (cal.fits) data
         try:
-            self.stage2_dir = os.path.join(self.data_dir, 'stage2')
-            self.stage2_filepath = os.path.join(self.stage2_dir, self.name, obs_n + suffix2)
-            with fits.open(self.stage2_filepath) as hdul:
-                self.cal_data = hdul[1].data
-            m, s = np.nanmedian(self.cal_data), np.nanstd(self.cal_data)
-            plt.figure()
-            plt.imshow(self.cal_data, origin='lower', vmin=m-s, vmax=m+s)
-            plt.savefig(os.path.join(self.obs_dir, 'cal_image.png'), bbox_inches="tight")
-            self.do_flux_cal = True
-        except FileNotFoundError:
+            self.stage2_filepath = os.path.join(self.data_dir, obs_n + suffix2)
+            self.do_flux_cal = os.path.exists(self.stage2_filepath)
+            if not self.do_flux_cal:
+                print("Cannot find the Stage 2 file --- No flux calibration will be performed")
+        except OSError:
             print("Cannot find the Stage 2 file --- No flux calibration will be performed")
             self.do_flux_cal = False
 
         # assigning data from ramp.fits file
-        with fits.open(self.stage1_filepath) as hdul:
-            self.data = hdul[1].data # science data
-            self.dq_2d_arr = hdul[2].data # data quality flag array for whole cube
-            self.dq_3d_arr = hdul[3].data # data quality flag array for each group
-            times = hdul[7].data
-            self.time_df = pd.DataFrame(times)
-            self.tgroup = hdul['PRIMARY'].header['TGROUP']
-            self.filename = hdul[0].header['FILENAME']
-            self.filter = hdul[0].header['FILTER']
-            self.subarray = hdul[0].header['SUBARRAY']
-            self.targname = hdul[0].header['TARGNAME']
+        with fits.open(self.stage1_filepath, ignore_missing_end=True) as hdul:
+            self.data = np.array(hdul[1].data)
+            self.dq_2d_arr = np.array(hdul[2].data)
+            try:
+                self.dq_3d_arr = np.array(hdul[3].data)
+            except (TypeError, OSError, ValueError):
+                print('GROUPDQ truncated — using zero DQ array')
+                self.dq_3d_arr = np.zeros(self.data.shape, dtype=np.uint8)
+            phdr = hdul['PRIMARY'].header
+            self.tgroup    = phdr['TGROUP']
+            self.filename  = phdr.get('FILENAME', self.obs_id)
+            self.filter    = phdr['FILTER']
+            self.subarray  = phdr['SUBARRAY']
+            self.targname  = phdr['TARGNAME']
+            self.substrt1  = phdr.get('SUBSTRT1', 1)   # 1-indexed FITS column start
+            self.substrt2  = phdr.get('SUBSTRT2', 1)   # 1-indexed FITS row start
+            try:
+                self.time_df = pd.DataFrame(hdul[7].data)
+            except (IndexError, KeyError):
+                n_i = len(self.data)
+                effinttm_days = phdr.get('EFFINTTM', self.tgroup * phdr.get('NGROUPS', 1)) / 86400.0
+                t0 = phdr.get('EXPSTART', 0.0)
+                starts = t0 + np.arange(n_i) * effinttm_days
+                self.time_df = pd.DataFrame({
+                    'integration_number': np.arange(1, n_i + 1),
+                    'int_start_MJD_UTC':  starts,
+                    'int_mid_MJD_UTC':    starts + effinttm_days / 2,
+                    'int_end_MJD_UTC':    starts + effinttm_days,
+                    'int_start_BJD_TDB':  starts,
+                    'int_mid_BJD_TDB':    starts + effinttm_days / 2,
+                    'int_end_BJD_TDB':    starts + effinttm_days,
+                })
+        # assigning data from cal.fits file
+        self.pixar_sr = None
+        if self.do_flux_cal:
+            with fits.open(self.stage2_filepath) as hdul:
+                self.cal_data = hdul[1].data
+                self.pixar_sr = hdul[1].header.get('PIXAR_SR', None)
+            m, s = np.nanmedian(self.cal_data), np.nanstd(self.cal_data)
+            plt.figure()
+            plt.imshow(self.cal_data,origin='lower',vmin=m-s,vmax=m+s)
+            plt.savefig(os.path.join(self.obs_dir, 'cal_image.png'), bbox_inches="tight")
+
 
         self.n_int = len(self.data) # number of integrations (ramps) in file
         self.n_group = len(self.data[0]) # number of groups per integration
@@ -344,10 +476,10 @@ class Jurassic():
             bad_frames.append(((integration+1)*self.n_group)-1)
         self.bad_frames = bad_frames
 
-        try:
+        if self.filter in self.psf_fwhm_px:
             self.fwhm = self.psf_fwhm_px[self.filter]
-        except:
-            print(f'Unable to find FWHM of filter {self.filter}') # need to use this to make the 
+        else:
+            raise ValueError(f'Unknown filter {self.filter}: no FWHM available')
 
     
     def ramp_correction(self,cube):
@@ -356,7 +488,16 @@ class Jurassic():
         and the reset switch charge decay effects
         """
         from rampdoctor import RampDoctor
-        self.gen_mask = np.load('full_MIRI_mask.npy') # for full array
+        _mask_path = os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy')
+        full_mask = np.load(_mask_path)
+        ny, nx = cube.shape[2], cube.shape[3]
+        if full_mask.shape == (ny, nx):
+            self.gen_mask = full_mask
+        else:
+            # Crop full-frame mask to subarray (SUBSTRT are 1-indexed FITS coords)
+            r0 = self.substrt2 - 1
+            c0 = self.substrt1 - 1
+            self.gen_mask = full_mask[r0:r0+ny, c0:c0+nx]
         rd = RampDoctor(cube=cube,bg_mask=self.gen_mask,verbose=True)
 
         self.data_cor = rd.correct(diagnostics=True) 
@@ -368,32 +509,53 @@ class Jurassic():
         Using the information from the reference files
         with the data model: MirImgPhotomModel
         """
-        # first get the conversion factor from the reference files
-        from jwst import datamodels
-        from stpipe import crds_client
+        photmjsr = None
+        uncertainty = None
+        filt = self.filter
 
-        with datamodels.open(self.stage1_filepath) as model:
-            crds_params = model.get_crds_parameters()
-            filt = model.meta.instrument.filter
+        try:
+            from jwst import datamodels
+            from stpipe import crds_client
 
-        # get the photom reference file from CRDS that corresponds to this exposure
-        photom_file = crds_client.get_reference_file(crds_params, 'photom', 'jwst')
-        print(f"Using PHOTOM ref: {photom_file}")
+            with datamodels.open(self.stage1_filepath) as model:
+                crds_params = model.get_crds_parameters()
+                filt = model.meta.instrument.filter
 
-        # open file and get information that matches the filter
-        with datamodels.MirImgPhotomModel(photom_file) as phot:
-            table = phot.phot_table
-            mask = table['filter'] == filt
-            row = table[mask]
-            photmjsr = float(row['photmjsr'][0])
-            uncertainty = float(row['uncertainty'][0])
-            print(f"{self.stage1_filepath}  filter={filt}  PHOTMJSR={photmjsr:.4f} MJy/sr per DN/s  +/- {uncertainty:.4f}")
+            photom_file = crds_client.get_reference_file(crds_params, 'photom', 'jwst')
+            print(f"Using PHOTOM ref: {photom_file}")
+
+            with datamodels.MirImgPhotomModel(photom_file) as phot:
+                table = phot.phot_table
+                mask = table['filter'] == filt
+                row = table[mask]
+                photmjsr = float(row['photmjsr'][0])
+                uncertainty = float(row['uncertainty'][0])
+        except Exception as e:
+            print(f"CRDS flux cal failed ({e}) — falling back to miri_photom.csv")
+
+        if photmjsr is None:
+            csv_path = os.path.join(os.path.dirname(__file__), 'miri_photom.csv')
+            phot_df = pd.read_csv(csv_path)
+            mask = (phot_df['filter'] == filt) & (phot_df['subarray'] == self.subarray)
+            if not mask.any():
+                mask = phot_df['filter'] == filt
+            row = phot_df[mask].iloc[0]
+            photmjsr = float(row['photmjsr'])
+            uncertainty = float(row['uncertainty'])
+
+        print(f"filter={filt}  PHOTMJSR={photmjsr:.4f} MJy/sr per DN/s  +/- {uncertainty:.4f}")
         self.flux_conv = photmjsr
         self.flux_uncert = uncertainty
 
-        # apply the conversion to science data - first need to change from DN/group to DN/s
-        group_times = np.arange(1,self.n_group+1) * self.tgroup
-        data_rate = cube / group_times[np.newaxis,:,np.newaxis,np.newaxis] # DN/s
+        # apply the conversion to science data - change from DN/group to DN/s.
+        # Rate is the group-to-group DN difference divided by the (constant)
+        # group time, not cumulative DN over cumulative time — the latter is
+        # a cumulative average that spuriously diverges at low group index.
+        # Group 0 has no preceding group to difference against, so it is left
+        # NaN (consistent with self.bad_frames already flagging the first
+        # frame of every integration as unusable downstream).
+        data_rate = np.full_like(cube, np.nan)
+        data_rate[:, 1:] = np.diff(cube, axis=1) / self.tgroup # DN/s
 
         self.flux_data = data_rate * self.flux_conv # MJy/sr
 
@@ -415,14 +577,7 @@ class Jurassic():
         dq_cube = np.concatenate(dq_ints,axis=1)
         self.dq_cube = np.squeeze(dq_cube) # bitwise cube with all the dq flags
 
-        flag = 4 # jump detected flag
-        jump_cube = np.full(self.dq_cube.shape, False, dtype=bool)
-
-        for frame in range(len(self.dq_cube)):
-            jump_arr = (self.dq_cube[frame] & flag) == flag
-            jump_cube[frame] = jump_arr
-
-        self.jump_cube = jump_cube # a boolean cube where True is for jumps detected
+        self.jump_cube = (self.dq_cube & 4) == 4
         
 
     def _circle_app(self,rad):
@@ -447,7 +602,7 @@ class Jurassic():
         threshold used to be 47000 but that let things pass through that we didn't want
         """
         # load general miri mask
-        mask = self.gen_mask # for full array
+        mask = self.gen_mask
 
         # mask out pixels that get counts above threshold
         mask_sat = self.rampy_cube_dn[-1] < threshold
@@ -542,38 +697,23 @@ class Jurassic():
         """
         makes a mega cube out of a rampy one
         """
-        frames = list(range(0,self.n_frame))
-        integrations = list(range(0,self.n_int))
-        int_frames = [i*self.n_group  for i in integrations]
+        ng = self.n_group
+        ni = self.n_int
+        mega_cube = np.zeros((self.n_frame, cube.shape[1], cube.shape[2]))
 
-        int_frames.pop(0) # in order to have list of indices of first frames in ramps except for the very first one
-        end_frames = [((i+1)*self.n_group)-1 for i in integrations] # want to remove the frames with these indices
+        # Integration 0: zero relative to its first frame
+        mega_cube[:ng] = cube[:ng] - cube[0]
 
-        mega_cube = np.zeros((self.n_frame,cube.shape[1],cube.shape[2]))
-        difference = 0 # difference between end of one ramp and start of next
-        zero_ff = 0 # fudge factor to zero the ramps
+        # Subsequent integrations: extrapolate the ramp value at the boundary
+        for i in range(1, ni):
+            i0 = i * ng
+            difference = mega_cube[i0-2] + 2*(mega_cube[i0-2] - mega_cube[i0-3])
+            mega_cube[i0:i0+ng] = cube[i0:i0+ng] - cube[i0] + difference
 
-        for frame in frames:
-            if frame == 0:
-                zero_ff = cube[frame]
-                mega_cube[frame] = cube[frame] - zero_ff
-            elif frame in int_frames:
-                zero_ff = cube[frame] 
-                difference = mega_cube[frame-2] + 2*(mega_cube[frame-2] - mega_cube[frame-3])
-                mega_cube[frame] = cube[frame] + difference - zero_ff
-            else:
-                mega_cube[frame] = cube[frame] + difference - zero_ff
-
-        # recalc int_frames
-        int_frames = [i * self.n_group for i in integrations]
-        end_frames = [(i+1) * self.n_group -1 for i in integrations]
-        int_frames.extend(end_frames)
-
+        # mask first and last frame of each integration
+        bad = [i * ng for i in range(ni)] + [(i+1) * ng - 1 for i in range(ni)]
         mega_cube_masked = mega_cube.copy()
-        nans_frame = np.full_like(mega_cube_masked[0], np.nan)
-
-        for frame in int_frames:
-            mega_cube_masked[frame] = nans_frame
+        mega_cube_masked[bad] = np.nan
 
         self.mega_cube = mega_cube
         self.mega_cube_masked = mega_cube_masked
@@ -586,10 +726,9 @@ class Jurassic():
         """
         if self.method == 'mega':
             fakeified_cube = cube.copy()
-            for int_num in range(self.n_int-1): # for all integrations but the last one
-                val = (int_num+1)*self.n_group
-                fakeified_cube[val-1] = 2*fakeified_cube[val-2] - fakeified_cube[val-3] # last frame of the integration
-                fakeified_cube[val] = 3*fakeified_cube[val-2] - 2*fakeified_cube[val-3] # first frame of the next integration
+            vals = np.arange(1, self.n_int) * self.n_group
+            fakeified_cube[vals - 1] = 2*fakeified_cube[vals - 2] - fakeified_cube[vals - 3]
+            fakeified_cube[vals]     = 3*fakeified_cube[vals - 2] - 2*fakeified_cube[vals - 3]
             self.fakey_cube = fakeified_cube
             self.grad_cube = np.gradient(fakeified_cube,axis=0)
 
@@ -644,10 +783,12 @@ class Jurassic():
             np.save(filepath, self.diff_cube)
 
 
-    def _psf_kernel(self,size=10):
+    def _psf_kernel(self):
         """
-        creates kernel based on filter using stpsf
+        creates kernel based on filter using stpsf; size scales with PSF FWHM
         """
+        fwhm = self.psf_fwhm_px.get(self.filter, 4.0)
+        size = max(11, int(round(6 * fwhm)) | 1)  # odd, at least 11, ~3 FWHM radius
         miri = stpsf.MIRI()
         miri.filter = self.filter
         psf = miri.calc_psf(fov_pixels=size)
@@ -658,7 +799,8 @@ class Jurassic():
         """
         using source extractor (sep) instead of StarFinder
         """
-        tasks = (delayed(_run_sep)(frame,cube[frame],self.kernel,self.mask_tot,save_plot,self.obs_dir,self.n_group)
+        psf_fwhm = getattr(self, 'fwhm', None)
+        tasks = (delayed(_run_sep)(frame, cube[frame], self.kernel, self.mask_tot, save_plot, self.obs_dir, self.n_group, psf_fwhm)
                                                     for frame in range(self.n_frame))
         
         # run sep in parallel
@@ -774,24 +916,24 @@ class Jurassic():
 
     def _cube_significance(self,magic_number=3):
         """
-        making a significance cube - dividing the differenced cube by the 
+        making a significance cube - dividing the differenced cube by the
         standard deviation of the background of each frame
         Then making a cut based on a ~magic number~ which at this point is just 3
         """
-        frame_num = list(range(0, self.n_frame))
-        sig_cube = np.zeros_like(self.diff_cube)
-
         dat = np.where(self.mask_tot[None, :, :], self.clean_cube, np.nan)
 
-        for frame in frame_num:
-            data = dat[frame].copy()
-            _, med, std = sigma_clipped_stats(data.copy())
+        def _frame_stats(frame_data):
+            _, med, std = sigma_clipped_stats(frame_data)
+            return med, std
 
-            sig_cube[frame] = (dat[frame]-med) / std
+        stats = Parallel(n_jobs=self.num_cores)(
+            delayed(_frame_stats)(dat[f]) for f in range(self.n_frame))
+        meds = np.array([s[0] for s in stats])
+        stds = np.array([s[1] for s in stats])
 
-        # compare with the cr ref mask and set to zero where mask is
+        sig_cube = (dat - meds[:, None, None]) / stds[:, None, None]
         sig_cube[self.ref_cr_mask] = 0
-        
+
         self.sig_cube = sig_cube
         self.bool_sig_cube = sig_cube > magic_number
 
@@ -802,16 +944,13 @@ class Jurassic():
         the bits above a threshold, above which should be psf-like sources
         and below are cosmic ray junk stuffs (ideally)
         """
-        frame_num = list(range(0, self.n_frame))
-        conv_sig_cube = np.zeros_like(self.sig_cube)
-        bool_threshold_cube = np.zeros_like(self.sig_cube)
-
-        for frame in frame_num:
-            conv_sig_cube[frame] = convolve_fft(self.bool_sig_cube[frame],self._circle_app(rad),normalize_kernel=False)
-            bool_threshold_cube[frame] = conv_sig_cube[frame] > threshold
-
+        kernel = self._circle_app(rad)
+        results = Parallel(n_jobs=self.num_cores)(
+            delayed(convolve_fft)(self.bool_sig_cube[f], kernel, normalize_kernel=False)
+            for f in range(self.n_frame))
+        conv_sig_cube = np.array(results)
         self.conv_sig_cube = conv_sig_cube
-        self.bool_threshold_cube = bool_threshold_cube
+        self.bool_threshold_cube = conv_sig_cube > threshold
 
 
     def _cube_rolling_sum(self,num_frames=4,threshold=3):
@@ -832,21 +971,18 @@ class Jurassic():
         # make cut for >= threshold
         bool_rolling_sum_cube = rolling_sum_cube >= threshold
 
-        # insert NaN frames here to keep cadence
-        nan_slice = np.full((rows,cols),np.nan)
-        false_slice = np.full((rows,cols),False)
+        # reinsert bad frames at their original positions by pre-allocating
+        # the full arrays and index-assigning the good frame values
+        n_total = self.bool_threshold_cube.shape[0]
+        good_idx = [i for i in range(n_total) if i not in set(self.bad_frames)]
 
-        i = 0
-        while i < len(self.bad_frames):
-            if i % 2 == 0:
-                #insert before itself - ik this doesn't make sense, trust me
-                rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
-                bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
-            else:
-                #insert after itself - I drew a little diagram to work this out (i now have no clue where this diag is)
-                rolling_sum_cube = np.insert(rolling_sum_cube, i, nan_slice, axis=0)
-                bool_rolling_sum_cube = np.insert(bool_rolling_sum_cube, i, false_slice, axis=0)
-            i += 1
+        rolling_sum_full = np.full((n_total, rows, cols), np.nan)
+        bool_rolling_sum_full = np.zeros((n_total, rows, cols), dtype=bool)
+        rolling_sum_full[good_idx] = rolling_sum_cube
+        bool_rolling_sum_full[good_idx] = bool_rolling_sum_cube
+
+        rolling_sum_cube = rolling_sum_full
+        bool_rolling_sum_cube = bool_rolling_sum_full
 
         self.rolling_sum_cube = rolling_sum_cube
         self.bool_rolling_sum_cube = bool_rolling_sum_cube
@@ -906,8 +1042,7 @@ class Jurassic():
 
         output = pd.DataFrame()
 
-        ids = df['objid'].tolist()
-        ids_list = list(range(1,ids[-1]+1))
+        ids_list = sorted(df['objid'].unique())
 
         for id in ids_list:
             obj_df = df[df['objid']==id]
@@ -929,47 +1064,125 @@ class Jurassic():
         return output
 
 
-    def asteroid_candidate(self, df,threshold_1=10,threshold_2=5,threshold_3=2):
+    def asteroid_candidate(self, df, threshold_1=10, threshold_2=5, threshold_3=2):
         """
-        Determines if in the grouped detections there are any potential asteroids
-        A potential asteroid has travelled a distance greater than 'threshold'.
-        Now updated to include different thresholds
+        Determines if in the grouped detections there are any potential asteroids.
+        Uses trajectory-based classification from _tag_asteroids when available,
+        otherwise falls back to displacement grading.
         """
+        ids = []
+
+        if 'asteroid_id' in df.columns and (df['asteroid_id'] > 0).any():
+            for ast_id in sorted(df[df['asteroid_id'] > 0]['asteroid_id'].unique()):
+                obj = df[df['asteroid_id'] == ast_id].sort_values('frame')
+                objid = int(obj['objid'].iloc[0])
+                x0, y0 = obj.iloc[0]['x'], obj.iloc[0]['y']
+                ids.append(f'Asteroid ID {ast_id}, Object: {objid}, '
+                           f'Start Coords: ({x0:.2f},{y0:.2f})')
+            return len(ids), ids
+
+        # Fallback: displacement grading
         num_candidates_1 = 0
         num_candidates_2 = 0
         num_candidates_3 = 0
-        ids = []
 
-        for id in range(1, df['objid'].max()+1):
+        for id in range(1, df['objid'].max() + 1):
             df_obj = df[df['objid'] == id]
-
             if len(df_obj) < 2:
                 continue
-
             try:
                 idx_min = df_obj['frame'].idxmin()
                 idx_max = df_obj['frame'].idxmax()
             except ValueError:
                 continue
-
             row_min = df_obj.loc[idx_min]
             row_max = df_obj.loc[idx_max]
+            dist = np.sqrt((row_max['x'] - row_min['x'])**2 +
+                           (row_max['y'] - row_min['y'])**2)
+            if dist > threshold_1:
+                num_candidates_1 += 1
+                ids.append(f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
+            elif dist > threshold_2:
+                num_candidates_2 += 1
+                ids.append(f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
+            elif dist > threshold_3:
+                num_candidates_3 += 1
+                ids.append(f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})')
 
-            dist = np.sqrt((row_max['x']-row_min['x'])**2 +
-                           (row_max['y']-row_min['y'])**2)
+        return num_candidates_1 + num_candidates_2 + num_candidates_3, ids
 
-            if  dist > threshold_1:
-                num_candidates_1+=1
-                ids.append((f'Grade 1, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
-            if dist < threshold_1 and dist > threshold_2:
-                num_candidates_2+=1
-                ids.append((f'Grade 2, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
-            if dist < threshold_2 and dist > threshold_3:
-                num_candidates_3+=1
-                ids.append((f'Grade 3, Object: {id}, Start Coords: ({row_min["x"]:.2f},{row_min["y"]:.2f})'))
 
-        return num_candidates_1+num_candidates_2+num_candidates_3, ids
-    
+    def _tag_asteroids(self, df, min_frames=5, min_displacement_px=2.0,
+                       max_residual_px=3.0, link_eps_px=5.0, min_track_frames=10):
+        """
+        Classifies objects as asteroids by fitting a linear trajectory (x, y vs mjd).
+        Objects with significant displacement and low trajectory residuals are flagged.
+        Nearby objects that fall on the same trajectory are linked with a shared asteroid_id.
+        Adds 'classification' and 'asteroid_id' columns.
+        """
+        from scipy import stats as scipy_stats
+
+        df = df.copy()
+        df['classification'] = 'Unknown'
+        df['asteroid_id'] = -1
+
+        objids = sorted([oid for oid in df['objid'].unique() if oid > 0])
+        tracks = {}
+
+        for objid in objids:
+            obj = df[df['objid'] == objid].sort_values('mjd')
+            if len(obj) < min_frames:
+                continue
+            x_vals = obj['x'].values
+            y_vals = obj['y'].values
+            mjd_vals = obj['mjd'].values
+            dist = np.sqrt((x_vals[-1] - x_vals[0])**2 + (y_vals[-1] - y_vals[0])**2)
+            if dist < min_displacement_px:
+                continue
+            t_ref = mjd_vals.mean()
+            t = mjd_vals - t_ref
+            slope_x, intercept_x, *_ = scipy_stats.linregress(t, x_vals)
+            slope_y, intercept_y, *_ = scipy_stats.linregress(t, y_vals)
+            pred_x = intercept_x + slope_x * t
+            pred_y = intercept_y + slope_y * t
+            rms = np.sqrt(np.mean((x_vals - pred_x)**2 + (y_vals - pred_y)**2))
+            if rms < max_residual_px:
+                tracks[objid] = dict(slope_x=slope_x, intercept_x=intercept_x,
+                                     slope_y=slope_y, intercept_y=intercept_y,
+                                     t_ref=t_ref, rms=rms)
+
+        if not tracks:
+            return df
+
+        # Link nearby non-asteroid objids onto existing trajectories
+        asteroid_objids = set(tracks.keys())
+        other_objids = set(objids) - asteroid_objids
+        assigned = {oid: oid for oid in asteroid_objids}
+
+        for other_oid in other_objids:
+            obj = df[df['objid'] == other_oid]
+            x_c = obj['x'].mean()
+            y_c = obj['y'].mean()
+            t_c = obj['mjd'].mean()
+            for leader_oid, tr in tracks.items():
+                dt = t_c - tr['t_ref']
+                pred_x = tr['intercept_x'] + tr['slope_x'] * dt
+                pred_y = tr['intercept_y'] + tr['slope_y'] * dt
+                if np.sqrt((x_c - pred_x)**2 + (y_c - pred_y)**2) < link_eps_px:
+                    assigned[other_oid] = leader_oid
+                    break
+
+        leaders = sorted(set(assigned.values()))
+        id_map = {leader: i + 1 for i, leader in enumerate(leaders)}
+
+        for oid, leader in assigned.items():
+            mask = df['objid'] == oid
+            if mask.sum() >= min_track_frames:
+                df.loc[mask, 'classification'] = 'Asteroid'
+                df.loc[mask, 'asteroid_id'] = id_map[leader]
+
+        return df
+
 
     def _time_mjd(self):
         """
@@ -984,7 +1197,7 @@ class Jurassic():
 
         for i in range(len(df)):
             start = df.loc[i, "int_start_MJD_UTC"]
-            end   = df.loc[i, "int_end_MJD_UTC"]
+            end = df.loc[i, "int_end_MJD_UTC"]
             times.extend(np.linspace(start,end,self.n_group))
 
         data = {'frame': frames, 'mjd': times}
@@ -999,6 +1212,127 @@ class Jurassic():
         df = df.merge(self.frame_mjd_df, on="frame", how="left")
 
         return df
+
+
+    def _psf_correlation(self, df, cutout_half=5):
+        """
+        Compute Pearson correlation between each detection cutout and a 2D Gaussian
+        PSF model (sigma = FWHM/2.355, sub-pixel shifted to the source centroid).
+        Adds 'psf_like' column; 1.0 = perfect PSF match, lower = extended/noise/CR.
+        """
+        from scipy.ndimage import shift as nd_shift
+
+        sigma = self.fwhm / (2 * np.sqrt(2 * np.log(2)))
+        size = 2 * cutout_half + 1
+        yg, xg = np.mgrid[-cutout_half:cutout_half + 1, -cutout_half:cutout_half + 1]
+        psf_base = np.exp(-(xg**2 + yg**2) / (2 * sigma**2))
+        psf_base /= psf_base.sum()
+
+        cube = self.diff_cube if hasattr(self, 'diff_cube') else self.clean_cube
+        ny, nx = cube.shape[1], cube.shape[2]
+        n_frames = cube.shape[0]
+
+        psf_like = np.full(len(df), np.nan)
+
+        for i, (_, row) in enumerate(df.iterrows()):
+            frame = int(row['frame'])
+            cx, cy = row['x'], row['y']
+            xi, yi = int(round(cx)), int(round(cy))
+
+            y0, y1 = yi - cutout_half, yi + cutout_half + 1
+            x0, x1 = xi - cutout_half, xi + cutout_half + 1
+
+            if frame >= n_frames or y0 < 0 or y1 > ny or x0 < 0 or x1 > nx:
+                continue
+
+            cutout = cube[frame, y0:y1, x0:x1].copy()
+            if cutout.shape != (size, size) or np.all(np.isnan(cutout)):
+                continue
+
+            # Shift PSF to sub-pixel centroid position
+            psf = nd_shift(psf_base, (cy - yi, cx - xi), mode='constant', cval=0)
+            psf_sum = psf.sum()
+            if psf_sum > 0:
+                psf /= psf_sum
+
+            valid = ~np.isnan(cutout)
+            if valid.sum() < 4:
+                continue
+
+            r = np.corrcoef(cutout[valid].flatten(), psf[valid].flatten())[0, 1]
+            psf_like[i] = r
+
+        df = df.copy()
+        df['psf_like'] = psf_like
+        return df
+
+
+    def make_video(self, objid, save_path, half=50, fps=20, dpi=100):
+        """
+        Save an MP4 video of a 2*half x 2*half px cutout centered on objid.
+        Color range is set from the brightest event frame.
+        Event frames are highlighted with a red border and annotated in the title.
+        Colorbar is matched to the image height.
+        """
+        import matplotlib.animation as animation
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+        obj = self.events[self.events['objid'] == objid].sort_values('frame')
+        if obj.empty:
+            raise ValueError(f'objid {objid} not found in self.events')
+
+        cx = int(round(obj['x'].mean()))
+        cy = int(round(obj['y'].mean()))
+        event_frames = set(obj['frame'].astype(int).tolist())
+
+        x0 = max(0, cx - half)
+        x1 = min(self.clean_cube.shape[2], cx + half)
+        y0 = max(0, cy - half)
+        y1 = min(self.clean_cube.shape[1], cy + half)
+        cutout = self.clean_cube[:, y0:y1, x0:x1]
+
+        # Skip NaN/zero frames
+        valid_frames = [i for i in range(cutout.shape[0])
+                        if not np.all(np.isnan(cutout[i])) and not np.all(cutout[i] == 0)]
+
+        # Color range from the brightest event frame
+        bright_frame = int(obj.loc[obj['sep_flux'].idxmax(), 'frame'])
+        bright_data = cutout[bright_frame]
+        vmin = np.nanpercentile(cutout[valid_frames], 1)
+        vmax = np.nanpercentile(bright_data[~np.isnan(bright_data)], 99) if not np.all(np.isnan(bright_data)) else vmin + 1
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes('right', size='5%', pad=0.05)
+
+        im = ax.imshow(cutout[valid_frames[0]], origin='lower', cmap='gray', vmin=vmin, vmax=vmax, animated=True)
+        plt.colorbar(im, cax=cax, label='DN/group')
+        ax.axvline(cx - x0, color='r', lw=0.5, alpha=0.4)
+        ax.axhline(cy - y0, color='r', lw=0.5, alpha=0.4)
+        title = ax.set_title(f'Frame {valid_frames[0]}', fontsize=12)
+
+        for spine in ax.spines.values():
+            spine.set_linewidth(2)
+
+        def update(i):
+            frame_idx = valid_frames[i]
+            im.set_data(cutout[frame_idx])
+            is_event = frame_idx in event_frames
+            color = 'red' if is_event else 'black'
+            label = '  [EVENT]' if is_event else ''
+            title.set_text(f'Frame {frame_idx}{label}')
+            title.set_color(color)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(color)
+            return im, title
+
+        fig.tight_layout()
+        ani = animation.FuncAnimation(fig, update, frames=len(valid_frames),
+                                      interval=1000 / fps, blit=False)
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        ani.save(save_path, writer='ffmpeg', fps=fps, dpi=dpi)
+        plt.close(fig)
+        print(f'Video saved to {save_path}')
 
 
     def plot_detection(self, save_dir, latex=True, lc_units='dn/s'):
@@ -1022,6 +1356,18 @@ class Jurassic():
         time = mjd_arr - mjd_arr[0]
         cadence = np.median(np.diff(time))
         group_time_s = cadence * 86400  # MJD days → seconds, for DN/s scaling
+
+        calibrated = getattr(self, 'cube_units', None) == 'mjy/sr'
+        has_pixar = calibrated and getattr(self, 'pixar_sr', None) is not None
+        if calibrated:
+            if lc_units == 'ujy' and has_pixar:
+                _ylabel = r'$\mu$Jy'
+            elif lc_units == 'mjy' and has_pixar:
+                _ylabel = 'MJy'
+            else:
+                _ylabel = r'MJy sr$^{-1}$' if not latex else r'MJy\,sr$^{-1}$'
+        else:
+            _ylabel = 'DN/s' if lc_units == 'dn/s' else 'DN/group'
 
         # Detect gaps in the time series
         med = np.nanmedian(np.diff(time))
@@ -1058,12 +1404,32 @@ class Jurassic():
                 # Aperture LC using filter FWHM as radius (buffer = floor(fwhm))
                 buf = int(np.floor(self.fwhm))
 
-                f = np.nansum(self.clean_cube[:,
-                                              max(0, y - buf):min(self.clean_cube.shape[1], y + buf + 1),
-                                              max(0, x - buf):min(self.clean_cube.shape[2], x + buf + 1)],
-                              axis=(1, 2))
-                if lc_units == 'dn/s':
-                    f = f / group_time_s
+                aperture = self.clean_cube[:,
+                                           max(0, y - buf):min(self.clean_cube.shape[1], y + buf + 1),
+                                           max(0, x - buf):min(self.clean_cube.shape[2], x + buf + 1)]
+                all_nan = np.all(np.isnan(aperture), axis=(1, 2))
+                if calibrated:
+                    n_pix = np.sum(~np.isnan(aperture), axis=(1, 2)).astype(float)
+                    n_pix[n_pix == 0] = np.nan
+                    if lc_units == 'ujy' and has_pixar:
+                        f = np.where(all_nan, np.nan, np.nansum(aperture, axis=(1, 2))) * self.pixar_sr * 1e6
+                    elif lc_units == 'mjy' and has_pixar:
+                        f = np.where(all_nan, np.nan, np.nansum(aperture, axis=(1, 2))) * self.pixar_sr
+                    else:
+                        f = np.where(all_nan, np.nan, np.nansum(aperture, axis=(1, 2)) / n_pix)
+                else:
+                    f = np.where(all_nan, np.nan, np.nansum(aperture, axis=(1, 2)))
+                    if lc_units == 'dn/s':
+                        f = f / group_time_s
+
+                # Strip NaN frames from both time and f; recompute breaks on clean arrays
+                valid_lc = ~np.isnan(f) & ~np.isnan(time)
+                time_c = time[valid_lc]
+                f_c = f[valid_lc]
+                med_c = np.nanmedian(np.diff(time_c))
+                std_c = np.nanstd(np.diff(time_c))
+                brk = np.where(np.diff(time_c) > med_c + std_c)[0]
+                brk = np.insert(np.append(brk + 1, len(time_c)), 0, 0)
 
                 # Brightest frame within detection span
                 if frame_end - frame_start >= 2:
@@ -1084,33 +1450,35 @@ class Jurassic():
                 fstart = frame_start - 20
                 if fstart < 0:
                     fstart = 0
-                zoom = f[fstart:frame_end + 20]
 
                 fig, ax = plt.subplot_mosaic([[1, 1, 1, 2, 2], [1, 1, 1, 3, 3]],
                                              figsize=(7 * 1.1, 5.5 * 1.1), constrained_layout=True)
 
                 # Ghost plot to fix inset ylims
-                ax[1].plot(time[fstart:frame_end + 20], zoom, 'k', alpha=0)
+                zoom_valid = valid_lc[fstart:frame_end + 20]
+                zoom_t = time[fstart:frame_end + 20][zoom_valid]
+                zoom_f = f[fstart:frame_end + 20][zoom_valid]
+                ax[1].plot(zoom_t, zoom_f, 'k', alpha=0)
                 insert_ylims = ax[1].get_ylim()
 
-                # Full light curve per segment
-                for seg in range(len(break_ind) - 1):
-                    ax[1].plot(time[break_ind[seg]:break_ind[seg + 1]],
-                               f[break_ind[seg]:break_ind[seg + 1]], 'k', alpha=0.8)
+                # Full light curve — NaN frames already removed in time_c/f_c
+                for seg in range(len(brk) - 1):
+                    ax[1].plot(time_c[brk[seg]:brk[seg + 1]],
+                               f_c[brk[seg]:brk[seg + 1]], 'k', alpha=0.8)
 
                 ylims = ax[1].get_ylim()
                 ax[1].set_ylim(ylims[0], ylims[1] + abs(ylims[0] - ylims[1]))
-                ax[1].set_xlim(np.min(time), np.max(time))
-                ax[1].set_title(f'{self.filename}   |   ObjID: {objid}', fontsize=15)
-                ax[1].set_ylabel('DN/s' if lc_units == 'dn/s' else 'DN/group', fontsize=15, labelpad=10)
+                ax[1].set_xlim(np.min(time_c), np.max(time_c))
+                ax[1].set_title(f'ObjID: {objid}', fontsize=15)
+                ax[1].set_ylabel(_ylabel, fontsize=15, labelpad=10)
                 ax[1].set_xlabel(f'Time (MJD - {np.round(mjd_arr[0], 3)})', fontsize=15)
 
                 axins = ax[1].inset_axes([0.1, 0.55, 0.86, 0.43])
                 axins.axvspan(time[frame_start] - cadence / 2,
                               time[frame_end] + cadence / 2, color='C1', alpha=0.4)
-                for seg in range(len(break_ind) - 1):
-                    axins.plot(time[break_ind[seg]:break_ind[seg + 1]],
-                               f[break_ind[seg]:break_ind[seg + 1]], 'k', alpha=0.8, marker='.')
+                for seg in range(len(brk) - 1):
+                    axins.plot(time_c[brk[seg]:brk[seg + 1]],
+                               f_c[brk[seg]:brk[seg + 1]], 'k', alpha=0.8, marker='.')
 
                 duration = frame_end - frame_start
                 if duration < 4:
@@ -1159,12 +1527,22 @@ class Jurassic():
                 ax[3].get_xaxis().set_visible(False)
                 ax[3].get_yaxis().set_visible(False)
 
-                # 20 frames later (or last available frame)
-                after = min(brightestframe + 20, len(cutout_image) - 1)
+                # 20 non-NaN frames after; fall back to 20 non-NaN frames before
+                valid_after = [i for i in range(brightestframe + 1, len(cutout_image))
+                               if not np.all(np.isnan(cutout_image[i]))]
+                if len(valid_after) >= 20:
+                    after = valid_after[19]
+                else:
+                    valid_before = [i for i in range(brightestframe)
+                                    if not np.all(np.isnan(cutout_image[i]))]
+                    after = valid_before[-20] if len(valid_before) >= 20 else (valid_before[0] if valid_before else brightestframe)
+
+                offset = after - brightestframe
+                after_label = f'+{offset}' if offset >= 0 else str(offset)
 
                 ax[3].imshow(cutout_image[after], cmap='gray', origin='lower',
                              vmin=vmin, vmax=vmax)
-                ax[3].set_title(f'Frame +{after - brightestframe}', fontsize=15)
+                ax[3].set_title(f'Frame {after_label}', fontsize=15)
                 ax[3].annotate('', xy=(0.2, 1.15), xycoords='axes fraction', xytext=(0.2, 1.),
                                arrowprops=dict(arrowstyle="<|-", color='r', lw=3))
                 ax[3].annotate('', xy=(0.8, 1.15), xycoords='axes fraction', xytext=(0.8, 1.),
@@ -1191,6 +1569,47 @@ class Jurassic():
                                          f'object{objid:04d}_event{eventid}of{total_events}.png'),
                             bbox_inches='tight')
                 plt.close(fig)
+
+
+    def _flux_calibrate(self):
+        """
+        Convert self.clean_cube from DN/group to MJy/sr using the bundled
+        miri_photom.csv (derived from jwst_miri_photom_0230.fits).
+
+        Applies exponential + linear time-dependent sensitivity corrections
+        at the median observation MJD, then divides by the group time so the
+        result is in MJy/sr (surface brightness per pixel).
+
+        Sets:
+            self.photmjsr : effective conversion factor [MJy/sr per DN/s]
+            self.cube_units : 'mjy/sr' (used by plot_detection for unit handling)
+        """
+        mjd_arr = self.frame_mjd_df['mjd'].values
+        group_time_s = np.nanmedian(np.diff(mjd_arr)) * 86400
+        mjd = np.nanmedian(mjd_arr)
+
+        csv_path = os.path.join(os.path.dirname(__file__), 'miri_photom.csv')
+        phot = pd.read_csv(csv_path)
+
+        filt = self.filter.strip()
+        sub = self.subarray.strip()
+        row = phot[(phot['filter'] == filt) & (phot['subarray'] == sub)]
+        if row.empty:
+            row = phot[(phot['filter'] == filt) & (phot['subarray'] == 'FULL')]
+        if row.empty:
+            raise ValueError(f'No photom entry for {filt}/{sub} in miri_photom.csv')
+        row = row.iloc[0]
+
+        dt_days = mjd - row['t0']
+        exp_corr = row['const'] + row['amplitude'] * np.exp(-dt_days / row['tau'])
+        lin_corr = 1.0 + row['lossperyear'] * (dt_days / 365.25)
+        self.photmjsr = row['photmjsr'] * exp_corr * lin_corr
+
+        self.clean_cube = self.clean_cube * (self.photmjsr / group_time_s)
+        self.cube_units = 'mjy/sr'
+
+        print(f'Flux calibration: filter={filt}, subarray={sub}, '
+              f'MJD={mjd:.3f}, photmjsr={self.photmjsr:.4f} MJy/sr per DN/s')
 
 
     def save_outputs(self):
@@ -1235,6 +1654,8 @@ class Jurassic():
             self.events = self.events.sort_values(by=['objid', 'frame'], ascending=[True, True])
             self.events = self._temporal_group(self.events)
             self.events = self.assign_mjd(self.events)
+            self.events = self._tag_asteroids(self.events)
+            self.events = self._psf_correlation(self.events)
             self.events.to_csv(os.path.join(self.grouped_dir, 'grouped_filtered_sep.csv'), index=False)
             if self.plot and len(self.events) > 0:
                 self.plot_detection(os.path.join(self.grouped_dir, 'detection_figures_sep'))
