@@ -727,8 +727,15 @@ class Jurassic():
         if self.method == 'mega':
             fakeified_cube = cube.copy()
             vals = np.arange(1, self.n_int) * self.n_group
-            fakeified_cube[vals - 1] = 2*fakeified_cube[vals - 2] - fakeified_cube[vals - 3]
-            fakeified_cube[vals]     = 3*fakeified_cube[vals - 2] - 2*fakeified_cube[vals - 3]
+            if len(vals) > 0:
+                fakeified_cube[vals - 1] = 2*fakeified_cube[vals - 2] - fakeified_cube[vals - 3]
+                fakeified_cube[vals]     = 3*fakeified_cube[vals - 2] - 2*fakeified_cube[vals - 3]
+            # Fakeify the absolute edge frames so np.gradient doesn't propagate
+            # their NaN to frames 1 and n_frame-2, which would leave no valid
+            # frames when n_group is small (≤4 with n_int=1).
+            if self.n_group >= 3:
+                fakeified_cube[0]  = 2*fakeified_cube[1]  - fakeified_cube[2]
+                fakeified_cube[-1] = 2*fakeified_cube[-2] - fakeified_cube[-3]
             self.fakey_cube = fakeified_cube
             self.grad_cube = np.gradient(fakeified_cube,axis=0)
 
