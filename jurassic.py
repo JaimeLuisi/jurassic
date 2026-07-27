@@ -547,17 +547,13 @@ class Jurassic():
         self.flux_conv = photmjsr
         self.flux_uncert = uncertainty
 
-        # apply the conversion to science data - change from DN/group to DN/s.
-        # Rate is the group-to-group DN difference divided by the (constant)
-        # group time, not cumulative DN over cumulative time — the latter is
-        # a cumulative average that spuriously diverges at low group index.
-        # Group 0 has no preceding group to difference against, so it is left
-        # NaN (consistent with self.bad_frames already flagging the first
-        # frame of every integration as unusable downstream).
-        data_rate = np.full_like(cube, np.nan)
-        data_rate[:, 1:] = np.diff(cube, axis=1) / self.tgroup # DN/s
-
-        self.flux_data = data_rate * self.flux_conv # MJy/sr
+        # Not applied here — self.rampy_cube stays in raw DN and feeds
+        # mega_inator / _cube_gradient / clean_cube unscaled. Only the final
+        # gradient image (self.clean_cube) is flux-calibrated, in
+        # _flux_calibrate(), to avoid double-calibrating and to keep frame 0
+        # of every integration a legitimate DN value for mega_inator's
+        # zero-point/extrapolation arithmetic.
+        self.flux_data = cube
 
 
     def _make_cubes(self):
