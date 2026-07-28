@@ -898,6 +898,11 @@ class Jurassic():
         clean_cube = np.array([r[0] for r in results])
         cr_mask_cube = np.array([r[1] for r in results])
 
+        # run_lacosmic zeroes NaN input (lacosmic can't accept NaN) and never
+        # restores it, so the first/last frame of every integration — masked
+        # NaN upstream in diff_cube — would otherwise silently become 0 here.
+        clean_cube[self.bad_frames] = np.nan
+
         self.cr_mask_cube = cr_mask_cube
         self.clean_cube = clean_cube
 
