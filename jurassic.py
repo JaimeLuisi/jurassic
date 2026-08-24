@@ -84,14 +84,64 @@ def run_lacosmic(frame_data, mask):
 
     return clean, crmask
 
+def _moment_elongation(img):
+    """
+    SEP-style elongation e = sqrt((Ixx-Iyy)^2 + 4*Ixy^2) / (Ixx+Iyy) of an
+    image, from non-negative-weighted second moments about its own
+    centroid. 0 = circularly symmetric, -> 1 = a line. Used to compare a
+    candidate's actual shape against what the model PSF predicts at the
+    same fit offset (see _psf_fit's elongation_excess).
+    """
+    ny, nx = img.shape
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    w = np.clip(img, 0, None)
+    wsum = w.sum()
+    if wsum <= 0:
+        return np.nan
+    xc = (w * xx).sum() / wsum
+    yc = (w * yy).sum() / wsum
+    Ixx = (w * (xx - xc) ** 2).sum() / wsum
+    Iyy = (w * (yy - yc) ** 2).sum() / wsum
+    Ixy = (w * (xx - xc) * (yy - yc)).sum() / wsum
+    denom = Ixx + Iyy
+    if denom <= 0:
+        return np.nan
+    return float(np.sqrt((Ixx - Iyy) ** 2 + 4 * Ixy ** 2) / denom)
+
+
 def _psf_fit(data_sub, x, y, kernel):
     """
     Fit PSF centroid by minimizing sum((norm_stamp - shifted_psf)**2) via Powell.
-    Returns (psf_like, x_psf, y_psf):
-      psf_like  — Pearson r between stamp and best-fit shifted PSF
-      x_psf     — refined centroid x in image coordinates
-      y_psf     — refined centroid y in image coordinates
-    Returns (nan, x, y) if stamp is out of bounds or has no variance.
+    Returns (psf_like, x_psf, y_psf, elongation_excess, symmetry180):
+      psf_like           — Pearson r between stamp and best-fit shifted PSF.
+                           A poor point-source discriminant on its own:
+                           Pearson correlation is scale/shift invariant, so
+                           an elongated cosmic-ray track can still correlate
+                           well with a round PSF template as long as the
+                           coarse "bright middle, faint edges" pattern lines
+                           up — it doesn't penalize the actual shape mismatch.
+      x_psf              — refined centroid x in image coordinates
+      y_psf              — refined centroid y in image coordinates
+      elongation_excess  — the core's own second-moment elongation (SEP-style
+                           e, 0=round) minus the elongation the model PSF
+                           shows at the same fit offset. ~0 for a real point
+                           source, distinctly positive for an elongated
+                           track — catches stretched-but-still-centered
+                           features that fool both psf_like and symmetry180
+                           (an elongated ellipse can still be inversion
+                           symmetric).
+      symmetry180        — Pearson r between the stamp core and its own
+                           180-degree rotation about the fit center. Needs no
+                           PSF model at all: a real (isotropic) PSF is
+                           symmetric under 180-degree rotation by
+                           construction, while a directional/comet-tail
+                           feature generally isn't. Exact (no interpolation)
+                           since the core is an odd-sized window centered on
+                           an integer pixel. Complementary to
+                           elongation_excess: catches lopsided/asymmetric
+                           tracks that a symmetric-ellipse elongation measure
+                           can miss.
+    Returns (nan, x, y, nan, nan) if stamp is out of bounds or has no variance.
     """
     from scipy.optimize import minimize
     from scipy.ndimage import shift as ndshift
@@ -102,13 +152,13 @@ def _psf_fit(data_sub, x, y, kernel):
     y0, y1 = yi - hs, yi + hs + 1
     x0, x1 = xi - hs, xi + hs + 1
     if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
-        return np.nan, x, y
+        return np.nan, x, y, np.nan, np.nan
 
     stamp = data_sub[y0:y1, x0:x1].astype(np.float64)
     stamp_sub = stamp - np.nanmedian(stamp)
     total = np.nansum(stamp_sub)
     if total == 0:
-        return np.nan, x, y
+        return np.nan, x, y, np.nan, np.nan
     stamp_norm = stamp_sub / total
 
     psf_norm = kernel.astype(np.float64) / kernel.sum()
@@ -140,15 +190,57 @@ def _psf_fit(data_sub, x, y, kernel):
     stamp_f = stamp_norm[core_sl].flatten()
     psf_f = psf_shifted[core_sl].flatten()
     if stamp_f.std() == 0 or psf_f.std() == 0:
-        return np.nan, x, y
+        return np.nan, x, y, np.nan, np.nan
 
     r = float(np.corrcoef(stamp_f, psf_f)[0, 1])
-    return r, float(xi + dx_fit), float(yi + dy_fit)
+
+    # elongation excess: data's own shape vs. what the model PSF predicts
+    # at this same fit offset, both measured identically (core window,
+    # background-subtracted, non-negative-weighted moments)
+    e_data = _moment_elongation(stamp_sub[core_sl])
+    e_psf = _moment_elongation(total * psf_shifted[core_sl])
+    elong_excess = e_data - e_psf if np.isfinite(e_data) and np.isfinite(e_psf) else np.nan
+
+    # 180-degree self-symmetry: model-free, exact (odd-sized window, integer center)
+    core = stamp_norm[core_sl]
+    core_rot = core[::-1, ::-1]
+    if core.std() == 0 or core_rot.std() == 0:
+        sym180 = np.nan
+    else:
+        sym180 = float(np.corrcoef(core.flatten(), core_rot.flatten())[0, 1])
+
+    return r, float(xi + dx_fit), float(yi + dy_fit), elong_excess, sym180
 
 
-def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, psf_corr_thresh=0.8):
+def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, psf_corr_thresh=0.8,
+             edge_margin_x=16, edge_margin_y=12, cr_mask=None, cr_frame_window=1, cr_px_window=1):
     """
     run source extractor in parallel
+
+    cr_mask : ndarray (n_frame, ny, nx) bool, optional
+        lacosmic's cosmic-ray mask (Jurassic.cr_mask_cube — NOT the
+        pipeline's JUMP_DET flag). Shape-based cuts (psf_like,
+        elongation_excess, symmetry180) cannot reliably separate cosmic
+        rays from real point sources on their own — a single-particle hit
+        near-normal-incidence produces a compact, genuinely PSF-like charge
+        cloud indistinguishable by shape from a real source at this
+        detector's pixel scale. lacosmic's Laplacian test is a better
+        per-detection reject signal because it asks a physically different
+        question than shape correlation alone: is this pixel-scale feature
+        consistent with real, telescope-optics-broadened light, or is it an
+        unresolved detector-level spike? A real transient must satisfy the
+        former regardless of its time behavior, so — unlike the pipeline's
+        JUMP_DET, which flags *any* sudden ramp discontinuity and can't
+        distinguish a cosmic ray from a genuine fast brightening — this
+        doesn't risk rejecting real discoveries (verified by injection
+        testing). It can still miss cosmic ray hits that happen to look
+        PSF-like at this pixel scale, but a false negative here is a far
+        safer failure mode than falsely rejecting a real transient. None
+        disables the check (e.g. for the first-pass call, before the mask
+        exists yet).
+    cr_frame_window, cr_px_window : int
+        Half-widths of the frame/pixel window checked around each
+        candidate for a cr_mask hit.
     """
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -176,9 +268,11 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, p
     # PSF fit: centroid refinement + shape correlation
     psf_results = [_psf_fit(data_sub, row['x'], row['y'], kernel)
                    for _, row in obj_df.iterrows()]
-    obj_df['psf_like'] = [r[0] for r in psf_results]
-    obj_df['x_psf']    = [r[1] for r in psf_results]
-    obj_df['y_psf']    = [r[2] for r in psf_results]
+    obj_df['psf_like']          = [r[0] for r in psf_results]
+    obj_df['x_psf']             = [r[1] for r in psf_results]
+    obj_df['y_psf']             = [r[2] for r in psf_results]
+    obj_df['elongation_excess'] = [r[3] for r in psf_results]
+    obj_df['symmetry180']       = [r[4] for r in psf_results]
 
     # aperture photometry
     flux, fluxerr, flag = sep.sum_circle(data_sub, obj_df['x'], obj_df['y'], 3.0, err=bkg.globalrms, gain=1.0) # ap radius = 3.0
@@ -187,16 +281,69 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, p
     obj_df['sep_s/n'] = flux/fluxerr
     obj_df['sep_flag'] = flag
 
+    # npix/tnpix: ratio of the full detected footprint (npix, at the SEP
+    # extraction threshold) to the deblended "core" area (tnpix). A real
+    # point source's footprint and core area are nearly the same thing
+    # (ratio ~1.1-1.7, empirically, regardless of S/N or background level —
+    # verified by injection testing in both the illuminated field and a
+    # totally dark part of the detector). Cosmic rays consistently run much
+    # higher (~2.2-3.6): even ones that pass the psf_like/elongation shape
+    # checks tend to have irregular low-level structure (secondary tracks,
+    # nearby associated hits from the same event) attached to an otherwise
+    # compact core, inflating the total footprint without inflating the
+    # core. This is a far more effective cosmic-ray discriminant than shape
+    # correlation alone or lacosmic (which only catches ~10% of the cosmic
+    # rays that pass the shape cuts, since lacosmic's sharp-edge assumption
+    # doesn't hold at this detector's pixel scale) — a cutoff of 2.0 here
+    # catches ~97% of known cosmic rays at only a ~2.5% false-reject cost on
+    # real point sources.
+    npix_ratio = obj_df['npix'] / obj_df['tnpix'].replace(0, np.nan)
+    obj_df['npix_ratio'] = npix_ratio
+
     # apply filtering: edge exclusion + PSF shape (correlation + fit didn't hit bound) + size
+    ny, nx = data.shape
     fit_dx = (obj_df['x_psf'] - obj_df['x']).abs()
     fit_dy = (obj_df['y_psf'] - obj_df['y']).abs()
-    filter_mask = (obj_df['x'].between(16, 1016) &
-                   obj_df['y'].between(12, 1012) &
+    filter_mask = (obj_df['x'].between(edge_margin_x, nx - edge_margin_x) &
+                   obj_df['y'].between(edge_margin_y, ny - edge_margin_y) &
                    (obj_df['psf_like'] >= psf_corr_thresh) &
-                   (fit_dx < 0.9) & (fit_dy < 0.9))
+                   (fit_dx < 0.9) & (fit_dy < 0.9) &
+                   (npix_ratio < 2.0))
     if psf_fwhm is not None:
         sigma_exp = psf_fwhm / (2 * np.sqrt(2 * np.log(2)))
-        filter_mask = filter_mask & (obj_df['a'] < 2.0 * sigma_exp)
+        # SEP's isophotal 'a' for a genuine (fixed-shape) PSF isn't brightness
+        # independent: extraction uses a fixed absolute threshold, so a
+        # brighter source's isophote reaches further into the same Gaussian
+        # wings before dropping below it. For a 2D Gaussian with std
+        # sigma_exp, the radius at which it crosses a given threshold is
+        # sigma_exp*sqrt(2*ln(peak/thresh)) -- growing with brightness. A
+        # brightness-independent cutoff (the old `2.0*sigma_exp`) therefore
+        # increasingly rejects real, genuinely round bright point sources
+        # (confirmed via injection-recovery testing: real S/N~200 sources
+        # were rejected ~70% of the time purely from this effect). Compare
+        # against this brightness-aware expectation instead, with a 1.5x
+        # margin for real PSF wings being a bit fatter than an ideal Gaussian
+        # and for ordinary SEP measurement noise.
+        ratio = np.maximum(obj_df['peak'] / obj_df['thresh'], 1.0001)
+        a_expected = sigma_exp * np.sqrt(2 * np.log(ratio))
+        a_expected = np.maximum(a_expected, sigma_exp)  # floor: never tighter than the old low-S/N limit
+        filter_mask = filter_mask & (obj_df['a'] < 1.5 * a_expected)
+
+    if cr_mask is not None:
+        n_frame_total = cr_mask.shape[0]
+        f0, f1 = max(0, frame - cr_frame_window), min(n_frame_total, frame + cr_frame_window + 1)
+        cr_window = cr_mask[f0:f1]
+        is_cr = np.zeros(len(obj_df), dtype=bool)
+        for i, (xi, yi) in enumerate(zip(obj_df['x'].values, obj_df['y'].values)):
+            xi, yi = int(round(xi)), int(round(yi))
+            y0, y1 = max(0, yi - cr_px_window), min(ny, yi + cr_px_window + 1)
+            x0, x1 = max(0, xi - cr_px_window), min(nx, xi + cr_px_window + 1)
+            is_cr[i] = cr_window[:, y0:y1, x0:x1].any()
+        obj_df['cr_flagged'] = is_cr
+        filter_mask = filter_mask & ~is_cr
+    else:
+        obj_df['cr_flagged'] = False
+
     filtered_df = obj_df[filter_mask]
 
     # plotting
@@ -230,6 +377,55 @@ def _run_sep(frame, data, kernel, mask, save, obs_dir, n_group, psf_fwhm=None, p
     return obj_df, filtered_df
 
 
+def _measure_fwhm_px(psf_array):
+    """
+    Measures FWHM (in pixels) of a detector-sampled PSF array by linearly
+    interpolating the half-max crossings on either side of the peak, along
+    the central row. Used for instruments without a pre-tabulated FWHM
+    lookup (e.g. NIRCam, whose FWHM varies strongly across its ~30 filters
+    and two pixel scales). Sub-pixel interpolation matters here: NIRCam's
+    SW channel is undersampled enough that sometimes only a single detector
+    pixel sits above half-max, which a whole-pixel-counting measurement
+    can't resolve.
+    """
+    ny, nx = psf_array.shape
+    row = psf_array[ny // 2]
+    peak = int(np.argmax(row))
+    half = row[peak] / 2.0
+
+    left = peak
+    while left > 0 and row[left] > half:
+        left -= 1
+    right = peak
+    while right < len(row) - 1 and row[right] > half:
+        right += 1
+    if left == peak or right == peak:
+        return np.nan
+
+    x_left = left + (half - row[left]) / (row[left + 1] - row[left])
+    x_right = (right - 1) + (row[right - 1] - half) / (row[right - 1] - row[right])
+    return float(x_right - x_left)
+
+
+def _forward_diff(cube):
+    """
+    Forward (not centered) difference along axis 0: out[i] = cube[i+1] - cube[i].
+
+    np.gradient's default centered difference, (cube[i+1]-cube[i-1])/2, is
+    the wrong tool for discrete up-the-ramp reads: a single-group event
+    (e.g. a cosmic ray) shows up smeared across two adjacent output frames,
+    since the centered stencil at index i straddles it from both sides
+    whichever group it lands in. A forward difference keeps a single-group
+    event in exactly one output frame. Keeps the same shape as the input by
+    setting the last frame to NaN (there's no cube[i+1] for it) -- that
+    index is always in Jurassic.bad_frames anyway (last frame of the last
+    integration), so nothing downstream relies on it having a value.
+    """
+    out = np.full_like(cube, np.nan)
+    out[:-1] = np.diff(cube, axis=0)
+    return out
+
+
 def make_reference_cube(pixel,grad_cube):
     """
     makes a reference cube and gets a median from it
@@ -247,7 +443,7 @@ def make_reference_cube(pixel,grad_cube):
 
 class Jurassic():
     """
-        Class for searching the ramps of full array MIRI images for fast transients
+        Class for searching the ramps of full array MIRI/NIRCam images for fast transients
 
         JURASSIC: JWST Up the Ramp Analysis Searching the Sky for Infrared Transients
     """
@@ -292,22 +488,23 @@ class Jurassic():
             "F2100W": 6.127,
             "F2550W": 7.300,
         }
-        
+        self.stpsf_class = { # instrument name -> stpsf class name
+            "MIRI": "MIRI",
+            "NIRCAM": "NIRCam",
+        }
+
         if run:
             self._assign_data()
+            if self.correct_ramps and self.instrument != 'MIRI':
+                print(f'{self.instrument}: BFE/RCD ramp correction is only validated for '
+                      f'MIRI — skipping ramp_correction() and using uncorrected ramps.')
+                self.correct_ramps = False
             if self.correct_ramps:
                 self.ramp_correction(cube=self.data)
             else:
                 self.data_cor = self.data
-                _mask_path = os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy')
-                full_mask = np.load(_mask_path)
                 ny, nx = self.data.shape[2], self.data.shape[3]
-                if full_mask.shape == (ny, nx):
-                    self.gen_mask = full_mask
-                else:
-                    r0 = self.substrt2 - 1
-                    c0 = self.substrt1 - 1
-                    self.gen_mask = full_mask[r0:r0+ny, c0:c0+nx]
+                self.gen_mask = self._get_gen_mask(ny, nx)
             self.flux_calibrate(cube=self.data_cor)
             self._make_cubes()
             del self.data, self.data_cor, self.flux_data
@@ -391,9 +588,10 @@ class Jurassic():
         if self.data_dir is None:
             self.data_dir = os.path.dirname(os.path.abspath(self.file))
 
-        # Remove the filename suffix
-        suffix1 = '_mirimage_ramp.fits'
-        suffix2 = '_mirimage_cal.fits'
+        # Remove the filename suffix (instrument/detector token + '_ramp.fits',
+        # e.g. '..._mirimage_ramp.fits' or '..._nrcb1_ramp.fits')
+        suffix1 = '_ramp.fits'
+        suffix2 = '_cal.fits'
         if self.obs_id.endswith(suffix1):
             obs_n = self.obs_id[:-len(suffix1)]
         else:
@@ -430,6 +628,9 @@ class Jurassic():
                 print('GROUPDQ truncated — using zero DQ array')
                 self.dq_3d_arr = np.zeros(self.data.shape, dtype=np.uint8)
             phdr = hdul['PRIMARY'].header
+            self.instrument = phdr['INSTRUME'].strip().upper()
+            self.detector   = phdr.get('DETECTOR', '').strip().upper()
+            self.pupil      = phdr.get('PUPIL', None)
             self.tgroup    = phdr['TGROUP']
             self.filename  = phdr.get('FILENAME', self.obs_id)
             self.filter    = phdr['FILTER']
@@ -476,39 +677,98 @@ class Jurassic():
             bad_frames.append(((integration+1)*self.n_group)-1)
         self.bad_frames = bad_frames
 
-        if self.filter in self.psf_fwhm_px:
-            self.fwhm = self.psf_fwhm_px[self.filter]
-        else:
-            raise ValueError(f'Unknown filter {self.filter}: no FWHM available')
+        self.fwhm = self._get_psf_fwhm_px()
 
-    
+
+    def _make_stpsf_instrument(self):
+        """
+        Builds the stpsf instrument object for self.instrument/self.filter,
+        setting the detector too where relevant (e.g. NIRCam, which has
+        multiple SCAs with different pixel scales).
+        """
+        cls_name = self.stpsf_class.get(self.instrument)
+        if cls_name is None:
+            raise ValueError(f'No stpsf model mapping for instrument {self.instrument}')
+        inst = getattr(stpsf, cls_name)()
+        inst.filter = self.filter
+        if self.instrument == 'NIRCAM' and self.detector:
+            # FITS DETECTOR keyword uses NRCA/BLONG for the LW channel;
+            # stpsf/webbpsf names that SCA NRCA/B5 instead.
+            inst.detector = self.detector.replace('LONG', '5')
+        return inst
+
+
+    def _get_psf_fwhm_px(self):
+        """
+        Returns the PSF FWHM in pixels for self.filter. MIRI uses the
+        pre-tabulated JDOX values (self.psf_fwhm_px); other instruments
+        (e.g. NIRCam, whose FWHM varies strongly across ~30 filters and
+        two pixel scales) measure it directly from an stpsf model instead
+        of relying on a hand-maintained table.
+        """
+        if self.instrument == 'MIRI':
+            if self.filter in self.psf_fwhm_px:
+                return self.psf_fwhm_px[self.filter]
+            raise ValueError(f'Unknown MIRI filter {self.filter}: no FWHM available')
+
+        inst = self._make_stpsf_instrument()
+        psf = inst.calc_psf(fov_pixels=41)
+        fwhm = _measure_fwhm_px(psf[3].data)
+        if np.isnan(fwhm):
+            raise ValueError(f'Could not measure PSF FWHM for {self.instrument}/{self.filter}')
+        return fwhm
+
+
+    def _get_gen_mask(self, ny, nx):
+        """
+        Returns the (ny, nx) boolean science-pixel mask (True = good).
+        MIRI uses the bundled full-frame bad-pixel mask, cropped to the
+        subarray (SUBSTRT are 1-indexed FITS coords). Other instruments have
+        no bundled mask, so fall back to a DQ-derived mask from the PIXELDQ
+        extension (DO_NOT_USE bit, bit 0 of the JWST DQ flag scheme).
+        """
+        if self.instrument == 'MIRI':
+            _mask_path = os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy')
+            full_mask = np.load(_mask_path)
+            if full_mask.shape == (ny, nx):
+                return full_mask
+            r0 = self.substrt2 - 1
+            c0 = self.substrt1 - 1
+            return full_mask[r0:r0+ny, c0:c0+nx]
+
+        return (self.dq_2d_arr & 1) == 0
+
+
     def ramp_correction(self,cube):
         """
         Uses rampdoctor to correct both the brighter-fatter effect
-        and the reset switch charge decay effects
+        and the reset switch charge decay effects.
+
+        RCD (reset charge decay) is a physical effect specific to MIRI's
+        Si:As detectors; NIRCam's HgCdTe detectors don't exhibit it, and BFE
+        hasn't been separately characterized/validated for NIRCam with this
+        tool yet, so this should only be called for MIRI (see __init__).
         """
         from rampdoctor import RampDoctor
-        _mask_path = os.path.join(os.path.dirname(__file__), 'full_MIRI_mask.npy')
-        full_mask = np.load(_mask_path)
         ny, nx = cube.shape[2], cube.shape[3]
-        if full_mask.shape == (ny, nx):
-            self.gen_mask = full_mask
-        else:
-            # Crop full-frame mask to subarray (SUBSTRT are 1-indexed FITS coords)
-            r0 = self.substrt2 - 1
-            c0 = self.substrt1 - 1
-            self.gen_mask = full_mask[r0:r0+ny, c0:c0+nx]
-        rd = RampDoctor(cube=cube,bg_mask=self.gen_mask,verbose=True)
+        self.gen_mask = self._get_gen_mask(ny, nx)
+        rd = RampDoctor(cube=cube,bg_mask=self.gen_mask,sci_mask=self.gen_mask,verbose=True)
 
-        self.data_cor = rd.correct(diagnostics=True) 
+        self.data_cor = rd.correct(diagnostics=True, charge_adaptive=False)
 
 
     def flux_calibrate(self,cube):
         """
         Calibrates the 4-dimensional ramp data (self.data)
-        Using the information from the reference files
-        with the data model: MirImgPhotomModel
+        Using the information from the reference files, via the
+        instrument-appropriate photom data model (e.g. MirImgPhotomModel,
+        NrcImgPhotomModel).
         """
+        photom_model_cls = { # instrument -> imaging PHOTOM datamodel class name
+            'MIRI': 'MirImgPhotomModel',
+            'NIRCAM': 'NrcImgPhotomModel',
+        }
+
         photmjsr = None
         uncertainty = None
         filt = self.filter
@@ -520,18 +780,30 @@ class Jurassic():
             with datamodels.open(self.stage1_filepath) as model:
                 crds_params = model.get_crds_parameters()
                 filt = model.meta.instrument.filter
+                pupil = model.meta.instrument.pupil
 
             photom_file = crds_client.get_reference_file(crds_params, 'photom', 'jwst')
             print(f"Using PHOTOM ref: {photom_file}")
 
-            with datamodels.MirImgPhotomModel(photom_file) as phot:
+            model_cls_name = photom_model_cls.get(self.instrument)
+            if model_cls_name is None:
+                raise ValueError(f'No PHOTOM datamodel mapping for instrument {self.instrument}')
+
+            with getattr(datamodels, model_cls_name)(photom_file) as phot:
                 table = phot.phot_table
-                mask = table['filter'] == filt
-                row = table[mask]
+                row_mask = table['filter'] == filt
+                if 'pupil' in table.dtype.names and pupil is not None:
+                    row_mask = row_mask & (table['pupil'] == pupil)
+                row = table[row_mask]
                 photmjsr = float(row['photmjsr'][0])
                 uncertainty = float(row['uncertainty'][0])
         except Exception as e:
-            print(f"CRDS flux cal failed ({e}) — falling back to miri_photom.csv")
+            print(f"CRDS flux cal failed ({e})", end='')
+            if self.instrument == 'MIRI':
+                print(" — falling back to miri_photom.csv")
+            else:
+                print(f" — no bundled fallback table for {self.instrument}")
+                raise
 
         if photmjsr is None:
             csv_path = os.path.join(os.path.dirname(__file__), 'miri_photom.csv')
@@ -596,12 +868,20 @@ class Jurassic():
         returns a list of tuples that are pixel (row,col) coordinates
         that have masked out the non-science and saturated pixels
         threshold used to be 47000 but that let things pass through that we didn't want
+
+        MIRI uses the calibrated DN threshold above (validated on MIRI data).
+        Other instruments have no such calibrated threshold, so they use the
+        SATURATED DQ flag (bit 1) from calwebb_detector1's own saturation
+        step instead.
         """
-        # load general miri mask
+        # load general mask (bad pixels / non-science)
         mask = self.gen_mask
 
-        # mask out pixels that get counts above threshold
-        mask_sat = self.rampy_cube_dn[-1] < threshold
+        # mask out saturated pixels
+        if self.instrument == 'MIRI':
+            mask_sat = self.rampy_cube_dn[-1] < threshold
+        else:
+            mask_sat = (self.dq_cube[-1] & 2) == 0  # SATURATED = bit 1
         mask_sat = mask_sat.astype(int) # to convolve with aperture
 
         kernel = self._circle_app(10)
@@ -719,6 +999,20 @@ class Jurassic():
         """
         make a gradient cube with the fakey fake frames for mega method
         for ramp method just takes the gradient then masks out bad frames
+
+        Uses a forward difference (grad[i] = cube[i+1] - cube[i]), not
+        np.gradient's centered difference. np.gradient approximates a
+        continuous derivative from samples — for discrete up-the-ramp reads
+        it has a real cost: a single-group event (a cosmic ray, a genuine
+        one-group jump) gets smeared across *two* output frames, since the
+        centered stencil at index i pulls in both cube[i-1] and cube[i+1].
+        That makes a single-frame event look like two consecutive frames of
+        signal, which is misleading for both visual inspection and any
+        multi-frame persistence reasoning. A forward difference keeps a
+        single-group event in exactly one output frame. The last frame has
+        no cube[i+1] to diff against and is set to NaN — this is already
+        always in self.bad_frames (the last frame of the last integration),
+        so nothing already relied on it having a value.
         """
         if self.method == 'mega':
             fakeified_cube = cube.copy()
@@ -726,17 +1020,17 @@ class Jurassic():
             if len(vals) > 0:
                 fakeified_cube[vals - 1] = 2*fakeified_cube[vals - 2] - fakeified_cube[vals - 3]
                 fakeified_cube[vals]     = 3*fakeified_cube[vals - 2] - 2*fakeified_cube[vals - 3]
-            # Fakeify the absolute edge frames so np.gradient doesn't propagate
-            # their NaN to frames 1 and n_frame-2, which would leave no valid
-            # frames when n_group is small (≤4 with n_int=1).
+            # Fakeify the absolute edge frames so the forward difference at
+            # frame n_frame-2 doesn't need an out-of-range cube[n_frame], and
+            # so small n_group (<=4 with n_int=1) still leaves valid frames.
             if self.n_group >= 3:
                 fakeified_cube[0]  = 2*fakeified_cube[1]  - fakeified_cube[2]
                 fakeified_cube[-1] = 2*fakeified_cube[-2] - fakeified_cube[-3]
             self.fakey_cube = fakeified_cube
-            self.grad_cube = np.gradient(fakeified_cube,axis=0)
+            self.grad_cube = _forward_diff(fakeified_cube)
 
         if self.method == 'ramp':
-            grad_cube = np.gradient(cube,axis=0)
+            grad_cube = _forward_diff(cube)
             grad_cube[self.bad_frames] = np.nan
             self.grad_cube = grad_cube
 
@@ -790,11 +1084,10 @@ class Jurassic():
         """
         creates kernel based on filter using stpsf; size scales with PSF FWHM
         """
-        fwhm = self.psf_fwhm_px.get(self.filter, 4.0)
+        fwhm = self.fwhm
         size = max(11, int(round(6 * fwhm)) | 1)  # odd, at least 11, ~3 FWHM radius
-        miri = stpsf.MIRI()
-        miri.filter = self.filter
-        psf = miri.calc_psf(fov_pixels=size)
+        inst = self._make_stpsf_instrument()
+        psf = inst.calc_psf(fov_pixels=size)
         self.kernel = psf[3].data
 
     
@@ -803,7 +1096,17 @@ class Jurassic():
         using source extractor (sep) instead of StarFinder
         """
         psf_fwhm = getattr(self, 'fwhm', None)
-        tasks = (delayed(_run_sep)(frame, cube[frame], self.kernel, self.mask_tot, save_plot, self.obs_dir, self.n_group, psf_fwhm)
+        # lacosmic's mask only, NOT jump_cube: JUMP_DET is a pure ramp-level
+        # statistical discontinuity test with no way to distinguish a cosmic
+        # ray from a real fast transient brightening -- using it here would
+        # systematically reject genuine discoveries. lacosmic instead tests
+        # spatial PSF-consistency (is this sharp/unresolved vs. properly
+        # optics-broadened), which a real transient satisfies regardless of
+        # its time behavior, so it doesn't have that failure mode (verified
+        # by injection testing — see cosmic_ray_shapes/).
+        cr_mask = getattr(self, 'cr_mask_cube', None)  # None on the first pass, before it exists
+        tasks = (delayed(_run_sep)(frame, cube[frame], self.kernel, self.mask_tot, save_plot, self.obs_dir, self.n_group, psf_fwhm,
+                                    cr_mask=cr_mask)
                                                     for frame in range(self.n_frame))
         
         # run sep in parallel
@@ -840,10 +1143,41 @@ class Jurassic():
             self.total_df.to_csv(filepath, index=False)
 
 
-    def _masked_reference(self,mask_correction,mask_radius=10):
+    def _masked_reference(self,mask_correction,mask_radius=10,max_gap_frames=20):
         """
         Makes a reference frame (median) but masks out any variable sources.
         Masks detected source positions and takes nanmedian of remaining pixels.
+
+        Two failure modes let a source leak into its own "background"
+        reference, discovered investigating a slow-moving (~0.02 px/frame)
+        bright MIRI asteroid that left a real, ~10+ sigma positive trace in
+        ref_frame_2 along its own track, which then self-subtracted into a
+        spurious negative dip whenever a given frame's true flux fell below
+        that contaminated reference:
+
+        1. mask_radius=10 px is smaller than the PSF model's own assumed
+           extent (jurassic's WebbPSF kernel stamp half-size, ~6xFWHM/2 —
+           13 px for F1500W). Masking a circle smaller than the PSF
+           template itself guarantees real wing flux lands just outside
+           the mask on every frame, biasing the reference high right where
+           the source sits. Fixed by flooring mask_radius at the kernel's
+           own half-size when self.kernel is available.
+        2. The mask only covers frames where SEP actually reported a
+           detection that frame. A frame where the source's per-frame
+           significance dips below threshold — including, self-reinforcingly,
+           frames already suffering from this exact contamination — gets
+           no mask at all, so its source-containing pixels flow straight
+           into the median uncorrected. Fixed by running this table through
+           the pipeline's own trajectory linker (_spatial_group +
+           _tag_asteroids) and, only for frames inside an asteroid-tagged
+           track's own span, filling gaps of up to max_gap_frames by linear
+           interpolation along that specific track's fitted trajectory.
+           Scoping the fill to a single linked, classified track (rather
+           than interpolating blindly between whatever SEP found in the
+           nearest bracketing frames) avoids bridging two unrelated sources
+           if the field has more than one — a real risk this early in the
+           pipeline, since this runs on the first-pass, per-frame catalog,
+           before the final grouping/classification later in the pipeline.
         """
         if self.filtered_sep_df.empty:
             self.second_ref_frame = self.first_ref_frame.copy()
@@ -853,22 +1187,70 @@ class Jurassic():
             self.second_ref_frame = self.first_ref_frame.copy()
             return
 
-        # source masks for each frame with detected variables
+        kernel_obj = getattr(self, 'kernel', None)
+        if kernel_obj is not None:
+            mask_radius = max(mask_radius, kernel_obj.shape[0] // 2)
+
+        # gap-fill positions: only a fallback for frames with NO real
+        # detection at all, so there's no multi-source ambiguity to resolve
+        # here -- the mean per detected frame is just the interpolation
+        # endpoint, not a replacement for that frame's own (possibly
+        # multi-row) mask below.
+        #
+        # Scoped to single linked tracks: run the pipeline's own DBSCAN
+        # spatial linker + trajectory classifier on this frame's detections
+        # (using 'frame' as a monotonic stand-in for 'mjd' -- _tag_asteroids
+        # only needs relative spacing for the linear fit, and real mjd
+        # isn't assigned yet at this point in the pipeline) so a gap only
+        # gets bridged when both bracketing detections have already been
+        # identified, by that same linking logic, as the same moving object.
+        det = self.filtered_sep_df
+        linked = self._spatial_group(det[['x', 'y', 'frame']].copy())
+        linked['mjd'] = linked['frame'].astype(float)
+        tagged = self._tag_asteroids(linked)
+
+        gap_fill = {}  # frame -> (x, y), only for frames absent from filtered_sep_df
+        for ast_id in sorted(tagged.loc[tagged['asteroid_id'] > 0, 'asteroid_id'].unique()):
+            track = tagged[tagged['asteroid_id'] == ast_id].sort_values('frame')
+            track_frames = track['frame'].values
+            track_x = track['x'].values
+            track_y = track['y'].values
+            for f0, x0, y0, f1, x1, y1 in zip(track_frames[:-1], track_x[:-1], track_y[:-1],
+                                               track_frames[1:], track_x[1:], track_y[1:]):
+                gap = f1 - f0
+                if 1 < gap <= max_gap_frames:
+                    for f in range(f0 + 1, f1):
+                        t = (f - f0) / gap
+                        gap_fill[f] = (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+
+        # source masks: real per-frame detections keep their original,
+        # possibly-multi-source handling; frames with no detection at all
+        # fall back to the interpolated position, so a transient
+        # non-detection (including one caused by this same self-subtraction
+        # effect) no longer leaves an unmasked window
         reference_cube = np.zeros_like(self.grad_cube)
         kernel = self._circle_app(mask_radius)
 
         for frame in self.frames:
-            if frame in self.filtered_sep_df['frame'].values:
-                mask = np.zeros_like(self.grad_cube[0])
+            has_detection = frame in self.filtered_sep_df['frame'].values
+            has_fill = frame in gap_fill
+            if not (has_detection or has_fill):
+                continue
 
+            mask = np.zeros_like(self.grad_cube[0])
+
+            if has_detection:
                 frame_df = self.filtered_sep_df[self.filtered_sep_df['frame'] == frame]
                 x_int = [round(x) for x in frame_df['x'].values]
                 y_int = [round(y) for y in frame_df['y'].values]
+            else:
+                gx, gy = gap_fill[frame]
+                x_int, y_int = [round(gx)], [round(gy)]
 
-                for i in range(len(x_int)):
-                    mask[y_int[i], x_int[i]] = 1
+            for i in range(len(x_int)):
+                mask[y_int[i], x_int[i]] = 1
 
-                reference_cube[frame] = convolve_fft(mask, kernel)
+            reference_cube[frame] = convolve_fft(mask, kernel)
 
         source_mask = reference_cube >= 0.00001  # boolean: True = source pixel to exclude
         self.source_mask = source_mask
@@ -884,6 +1266,36 @@ class Jurassic():
         # NaN out source pixels, then make reference from median
         masked_slices = np.where(mask_slices, np.nan, good_slices)
         self.second_ref_frame = np.nanmedian(masked_slices, axis=0)
+
+        # A pixel goes NaN here only if the source's mask covered it in
+        # every single valid frame -- true whenever the source's own
+        # trajectory over the segment is smaller than the mask footprint
+        # (exactly this slow-moving asteroid: ~12-16 px of total drift
+        # across the segment vs a ~26 px mask diameter), so there's no time
+        # in the whole segment this pixel is ever clear. Left as NaN, that
+        # hole poisons diff_cube = grad_cube - reference at that exact
+        # detector position for every frame in the segment, not just some
+        # -- silently erasing the source's own detectability across
+        # whatever portion of the track sits deep enough in its own mask
+        # footprint to starve every frame (this is what turned a modest,
+        # ~10 sigma reference contamination into a ~280-frame dead zone
+        # with zero detections, found testing on a single segment before
+        # running the full 7-segment set). Fill any such holes from the
+        # local background via Gaussian interpolation instead of leaving
+        # them empty -- a locally-smooth fallback beats an outright hole,
+        # even though it's a coarser estimate than a real temporal median.
+        nan_holes = np.isnan(self.second_ref_frame)
+        if nan_holes.any():
+            from astropy.convolution import Gaussian2DKernel, interpolate_replace_nans
+            filled = self.second_ref_frame.copy()
+            stddev = mask_radius
+            for _ in range(4):  # widen the kernel until every hole is bridged
+                fill_kernel = Gaussian2DKernel(x_stddev=stddev)
+                filled = interpolate_replace_nans(filled, fill_kernel)
+                if not np.isnan(filled).any():
+                    break
+                stddev *= 2
+            self.second_ref_frame = filled
 
         filepath = os.path.join(self.obs_dir, "ref_frame_2.npy")
         np.save(filepath, self.second_ref_frame)
@@ -1581,12 +1993,15 @@ class Jurassic():
 
     def _flux_calibrate(self):
         """
-        Convert self.clean_cube from DN/group to MJy/sr using the bundled
-        miri_photom.csv (derived from jwst_miri_photom_0230.fits).
+        Convert self.clean_cube from DN/group to MJy/sr, then divide by the
+        group time so the result is in MJy/sr (surface brightness per pixel).
 
-        Applies exponential + linear time-dependent sensitivity corrections
-        at the median observation MJD, then divides by the group time so the
-        result is in MJy/sr (surface brightness per pixel).
+        MIRI uses the bundled miri_photom.csv (derived from
+        jwst_miri_photom_0230.fits) with its exponential + linear
+        time-dependent sensitivity-loss correction applied at the median
+        observation MJD. No such drift model is available for other
+        instruments, so they use the static CRDS photmjsr from
+        flux_calibrate() (set on self.flux_conv) with no time correction.
 
         Sets:
             self.photmjsr : effective conversion factor [MJy/sr per DN/s]
@@ -1594,30 +2009,37 @@ class Jurassic():
         """
         mjd_arr = self.frame_mjd_df['mjd'].values
         group_time_s = np.nanmedian(np.diff(mjd_arr)) * 86400
-        mjd = np.nanmedian(mjd_arr)
 
-        csv_path = os.path.join(os.path.dirname(__file__), 'miri_photom.csv')
-        phot = pd.read_csv(csv_path)
+        if self.instrument == 'MIRI':
+            mjd = np.nanmedian(mjd_arr)
 
-        filt = self.filter.strip()
-        sub = self.subarray.strip()
-        row = phot[(phot['filter'] == filt) & (phot['subarray'] == sub)]
-        if row.empty:
-            row = phot[(phot['filter'] == filt) & (phot['subarray'] == 'FULL')]
-        if row.empty:
-            raise ValueError(f'No photom entry for {filt}/{sub} in miri_photom.csv')
-        row = row.iloc[0]
+            csv_path = os.path.join(os.path.dirname(__file__), 'miri_photom.csv')
+            phot = pd.read_csv(csv_path)
 
-        dt_days = mjd - row['t0']
-        exp_corr = row['const'] + row['amplitude'] * np.exp(-dt_days / row['tau'])
-        lin_corr = 1.0 + row['lossperyear'] * (dt_days / 365.25)
-        self.photmjsr = row['photmjsr'] * exp_corr * lin_corr
+            filt = self.filter.strip()
+            sub = self.subarray.strip()
+            row = phot[(phot['filter'] == filt) & (phot['subarray'] == sub)]
+            if row.empty:
+                row = phot[(phot['filter'] == filt) & (phot['subarray'] == 'FULL')]
+            if row.empty:
+                raise ValueError(f'No photom entry for {filt}/{sub} in miri_photom.csv')
+            row = row.iloc[0]
+
+            dt_days = mjd - row['t0']
+            exp_corr = row['const'] + row['amplitude'] * np.exp(-dt_days / row['tau'])
+            lin_corr = 1.0 + row['lossperyear'] * (dt_days / 365.25)
+            self.photmjsr = row['photmjsr'] * exp_corr * lin_corr
+
+            print(f'Flux calibration: filter={filt}, subarray={sub}, '
+                  f'MJD={mjd:.3f}, photmjsr={self.photmjsr:.4f} MJy/sr per DN/s')
+        else:
+            self.photmjsr = self.flux_conv
+
+            print(f'Flux calibration: filter={self.filter}, instrument={self.instrument}, '
+                  f'photmjsr={self.photmjsr:.4f} MJy/sr per DN/s (no time-dependent correction)')
 
         self.clean_cube = self.clean_cube * (self.photmjsr / group_time_s)
         self.cube_units = 'mjy/sr'
-
-        print(f'Flux calibration: filter={filt}, subarray={sub}, '
-              f'MJD={mjd:.3f}, photmjsr={self.photmjsr:.4f} MJy/sr per DN/s')
 
 
     def save_outputs(self):
