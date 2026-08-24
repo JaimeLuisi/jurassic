@@ -63,18 +63,20 @@ r_star = np.sqrt((yy - STAR_Y) ** 2 + (xx - STAR_X) ** 2)
 ap_mask = r_star <= AP_RADIUS
 print(f'\nAperture pixels: {ap_mask.sum()}')
 
-# rampy_cube is already a per-group rate cube (flux_calibrate differences
-# consecutive groups internally); reshape the flattened frame-stream
-# (n_int*n_group, ny, nx) back to (n_int, n_group, ny, nx). Group index 0 is
-# NaN (no preceding group to difference against).
-def reshape(rampy_cube):
-    return rampy_cube.reshape(n_int, n_group, ny, nx)
+# rampy_cube is flux_calibrate's cumulative-ramp cube scaled by a constant
+# (MJy/sr per DN/s conversion / tgroup), not pre-differenced. Reshape the
+# flattened frame-stream (n_int*n_group, ny, nx) back to (n_int, n_group,
+# ny, nx) and difference consecutive groups here, exactly as mega_inator /
+# _cube_gradient does downstream in the real pipeline.
+def reshape_and_grad(rampy_cube):
+    cube4 = rampy_cube.reshape(n_int, n_group, ny, nx)
+    return np.diff(cube4, axis=1)   # (n_int, n_group-1, ny, nx)
 
-grads_raw = reshape(j_raw.rampy_cube)
-grads_cor = reshape(j_cor.rampy_cube)
+grads_raw = reshape_and_grad(j_raw.rampy_cube)
+grads_cor = reshape_and_grad(j_cor.rampy_cube)
 
-# exclude group 0 (NaN) and the last-frame anomaly (group n_group-1)
-g_good = np.arange(1, n_group - 1)
+# exclude the first and last gradient (reset boundary / last-frame anomaly)
+g_good = np.arange(1, n_group - 2)
 
 def lc_of(grads):
     lc = grads[:, g_good][:, :, ap_mask].sum(axis=2)
